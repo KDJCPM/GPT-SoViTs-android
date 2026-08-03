@@ -1,0 +1,38 @@
+.gradle/
+.idea/
+local.properties
+**/build/
+*.iml
+converted_models/
+
+# Generated Android packages and local signing configuration.
+*.apk
+*.aab
+*.jks
+*.keystore
+keystore.properties
+
+# Converted models, source checkpoints and generated media.
+*.gsvm
+*.pth
+*.ckpt
+*.pt
+*.onnx
+*.wav
+
+# Python caches and local environments.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local tooling output.
+*.log
+.DS_Store
+
+# Private hosted converter.
+tools/converter_web.py
+tools/converter_web/
+tools/requirements-converter-web.txt
+tests/test_converter_web.py

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Debug/engineering path for the user-provided /sdcard/models/GS directory. Normal
+         releases should use the Storage Access Framework picker and do not need this app-op. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application
+        android:allowBackup="true"
+        android:extractNativeLibs="true"
+        android:label="GSV Mobile"
+        android:theme="@style/Theme.GSVMobile">
+        <!-- QNN HTP V79/V81 stubs use Qualcomm's system FastRPC transport. These declarations
+             place the vendor libraries in the app linker namespace when the device exposes them;
+             QNN remains optional on devices without the libraries. -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+        <uses-native-library android:name="libadsprpc.so" android:required="false" />
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
