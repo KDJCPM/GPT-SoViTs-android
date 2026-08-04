@@ -47,7 +47,8 @@ class AcousticPipeline(torch.nn.Module):
             if last_token == self.eos:
                 break
         semantic = y[:, -generated:].unsqueeze(0)
-        audio = self.vits(semantic, text_seq, self.reference_spectrogram, self.speaker_embedding, speed_factor)
+        speed = torch.tensor(speed_factor, dtype=torch.float32, device=text_seq.device)
+        audio = self.vits(semantic, text_seq, self.reference_spectrogram, self.speaker_embedding, speed)
         audio = audio.reshape(-1).float().clamp(-1.0, 1.0)
         pcm = torch.round(audio * 32767.0).to(torch.int32)
         return 32000, pcm

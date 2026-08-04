@@ -1,0 +1,35 @@
+[Unit]
+Description=GPT-SoVITS isolated conversion backend
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/z/download/gpt/webconvert
+Environment=GSVM_HOST=127.0.0.1
+Environment=GSVM_PORT=8090
+Environment=GSVM_WORKERS=1
+Environment=GSVM_MAX_UPLOAD_BYTES=1073741824
+Environment=GSVM_CONVERSION_TIMEOUT_SECONDS=1800
+Environment=GSVM_EGRESS_LIMIT_BYTES=295000000000
+Environment=GSVM_EGRESS_STATE=/home/z/download/gpt/webconvert/state/egress.json
+Environment=GSVM_UPLOADS_PER_IP=5
+EnvironmentFile=/home/z/.config/gsvm-web-convert/backend.env
+Environment=GSVM_ANDROID_ROOT=/home/z/download/gpt/android
+Environment=GSVM_UPSTREAM_ROOT=/home/z/download/gpt
+Environment=GSVM_PYTHON=/home/z/download/gpt/gpt/bin/python
+Environment=GSVM_PYTHON_ROOT=/home/z/download/gpt/gpt
+Environment=GSVM_JOB_ROOT=/home/z/download/gpt/webconvert/jobs
+Environment=GSVM_BERT=/home/z/download/gpt/GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large/pytorch_model.bin
+Environment=GSVM_VOCODER=/home/z/download/gpt/GPT_SoVITS/pretrained_models/gsv-v4-pretrained/vocoder.pth
+Environment=GSVM_V2PP_TEMPLATE=/home/z/download/gpt/webconvert/build/v2pp-static-template.zip
+Environment=GSVM_V4_TEMPLATE=/home/z/download/gpt/webconvert/build/v4-static-template.zip
+Environment=GSVM_JOB_RUNNER=/home/z/download/gpt/webconvert/sandbox_runner.sh
+ExecStart=/home/z/download/gpt/gpt/bin/python /home/z/download/gpt/webconvert/server.py
+Restart=on-failure
+RestartSec=5
+TasksMax=512
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,28 @@
+[Unit]
+Description=GPT-SoVITS Web Converter
+After=network-online.target data.mount
+Wants=network-online.target
+RequiresMountsFor=/data/web-convert/jobs
+
+[Service]
+Type=simple
+WorkingDirectory=/root/web-convert
+Environment=GSVM_HOST=127.0.0.1
+Environment=GSVM_PORT=8090
+Environment=GSVM_WORKERS=1
+Environment=GSVM_JOB_ROOT=/data/web-convert/jobs
+ExecStart=/root/web-convert/.venv/bin/python /root/web-convert/server.py
+Restart=on-failure
+RestartSec=5
+CPUQuota=40%
+MemoryHigh=1536M
+MemoryMax=9G
+TasksMax=128
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/data/web-convert/jobs
+
+[Install]
+WantedBy=multi-user.target

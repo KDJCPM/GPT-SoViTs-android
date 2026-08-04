@@ -1,0 +1,17 @@
+gs.cutefireflyuwu.sbs {
+	encode zstd gzip
+	handle /health {
+		reverse_proxy 127.0.0.1:18090 {
+			header_up X-GSVM-Backend-Key {$GSVM_BACKEND_KEY}
+		}
+	}
+	handle /api/* {
+		request_body {
+			max_size 1GB
+		}
+		reverse_proxy 127.0.0.1:18090 {
+			header_up X-GSVM-Backend-Key {$GSVM_BACKEND_KEY}
+		}
+	}
+	reverse_proxy 127.0.0.1:8090
+}

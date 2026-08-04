@@ -100,7 +100,10 @@ class Utf8TtsPipeline(torch.nn.Module):
     def synthesize_preprocessed(self, phone_ids: torch.Tensor, token_ids: torch.Tensor,
                                 word2ph: torch.Tensor, chinese_mask: torch.Tensor,
                                 seed: int=-1) -> Tuple[int,torch.Tensor]:
-        return self.synthesize_preprocessed_options(phone_ids, token_ids, word2ph, chinese_mask, seed)
+        return self.synthesize_preprocessed_options(
+            phone_ids, token_ids, word2ph, chinese_mask, seed,
+            1.0, 1.0, 10, 1.35, 1.0, 32,
+        )
 
     @torch.jit.export
     def synthesize_preprocessed_options(self, phone_ids: torch.Tensor, token_ids: torch.Tensor,
@@ -232,7 +235,7 @@ def main():
     acoustic_path=a.acoustic.resolve() if a.acoustic else artifacts/'pipeline_core.pt'
     bert=torch.jit.load(str(bert_path),map_location='cpu'); acoustic=torch.jit.load(str(acoustic_path),map_location='cpu')
     module=torch.jit.script(Utf8TtsPipeline(bert,acoustic,phones,tokens,chinese,phrase_trie).eval())
-    module=torch.jit.freeze(module,preserved_attrs=['synthesize_preprocessed']); module.save(str(output))
+    module=torch.jit.freeze(module,preserved_attrs=['synthesize_preprocessed', 'synthesize_preprocessed_options']); module.save(str(output))
     print(f'Created {output} ({output.stat().st_size} bytes); symbols={len(phones)}')
 
 if __name__=='__main__': main()

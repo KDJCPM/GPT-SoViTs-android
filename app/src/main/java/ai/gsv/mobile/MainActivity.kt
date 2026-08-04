@@ -14,6 +14,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
@@ -294,6 +295,7 @@ class MainActivity : ComponentActivity() {
 
     private fun stopApiServer() { apiServer?.stop(); apiServer = null; ui = ui.copy(serverEnabled = false, serverStatus = "已停止") }
     private fun setBusy(status: String) { ui = ui.copy(busy = true, status = status) }
+    private fun openWebsite(url: String) = startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
 
     @Composable private fun MainScreen() {
         var tab by rememberSaveable { mutableIntStateOf(0) }
@@ -303,8 +305,9 @@ class MainActivity : ComponentActivity() {
                     Tab(tab == 0, { tab = 0 }, text = { Text("合成") })
                     Tab(tab == 1, { tab = 1 }, text = { Text("模型") })
                     Tab(tab == 2, { tab = 2 }, text = { Text("设置") })
+                    Tab(tab == 3, { tab = 3 }, text = { Text("关于") })
                 }
-                when (tab) { 0 -> SynthesisPane(); 1 -> ModelLibraryPane(); else -> SettingsPane() }
+                when (tab) { 0 -> SynthesisPane(); 1 -> ModelLibraryPane(); 2 -> SettingsPane(); else -> AboutPane() }
             }
         }
         if (ui.showFirstRun) ComponentDialog()
@@ -360,6 +363,11 @@ class MainActivity : ComponentActivity() {
                 Button({ if (ui.pipelineInstalled) pickModel.launch(packageTypes) else ui = ui.copy(showFirstRun = true) }, enabled = !ui.busy, modifier = Modifier.weight(1f)) { Icon(Icons.Default.UploadFile, null); Spacer(Modifier.width(6.dp)); Text("添加声音模型") }
                 OutlinedButton({ pickCombined.launch(packageTypes) }, enabled = !ui.busy, modifier = Modifier.weight(1f)) { Text("添加完整包") }
             }
+            TextButton({ openWebsite(MODEL_CONVERTER_URL) }) {
+                Text("如何获取 .gsvm?")
+                Spacer(Modifier.width(6.dp))
+                Icon(Icons.AutoMirrored.Filled.OpenInNew, "在浏览器中打开")
+            }
             HorizontalDivider()
             Text("模型清单", style = MaterialTheme.typography.titleLarge)
             if (ui.models.isEmpty()) {
@@ -407,10 +415,33 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @Composable private fun AboutPane() {
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Text("GSV Mobile", style = MaterialTheme.typography.headlineSmall)
+            Text("面向 Android 的 GPT-SoVITS V2 Pro Plus 与 V4 FP32 部署工具。", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            HorizontalDivider()
+            Text("项目链接", style = MaterialTheme.typography.titleMedium)
+            OutlinedButton({ openWebsite(PROJECT_URL) }, modifier = Modifier.fillMaxWidth()) {
+                Text("GPT-SoViTs-android", modifier = Modifier.weight(1f))
+                Icon(Icons.AutoMirrored.Filled.OpenInNew, "在浏览器中打开")
+            }
+            OutlinedButton({ openWebsite(UPSTREAM_URL) }, modifier = Modifier.fillMaxWidth()) {
+                Text("GPT-SoVITS 上游项目", modifier = Modifier.weight(1f))
+                Icon(Icons.AutoMirrored.Filled.OpenInNew, "在浏览器中打开")
+            }
+            Text("本项目采用 GPL-3.0；上游项目及第三方组件遵循各自许可证。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+
     @Composable private fun NumberField(label: String, value: String, change: (String) -> Unit, modifier: Modifier) = OutlinedTextField(value, change, modifier, label = { Text(label) }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
     override fun onDestroy() { apiServer?.stop(); player?.release(); synchronized(engineLock) { engine.close() }; super.onDestroy() }
 
-    companion object { private val packageTypes = arrayOf("application/zip", "application/octet-stream") }
+    companion object {
+        private val packageTypes = arrayOf("application/zip", "application/octet-stream")
+        private const val MODEL_CONVERTER_URL = "https://gs.cutefireflyuwu.sbs"
+        private const val PROJECT_URL = "https://github.com/tuxKOH/GPT-SoViTs-android"
+        private const val UPSTREAM_URL = "https://github.com/RVC-Boss/GPT-SoVITS"
+    }
 }
 
 private data class UiState(

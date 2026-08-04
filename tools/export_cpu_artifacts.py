@@ -27,7 +27,8 @@ def main() -> None:
     env=dict(os.environ, is_half='False', version=profile.id)
     common=[str(python)]
     if profile.cpu_exporter == 'torchscript_stream_pro':
-        command=common+["GPT_SoVITS/stream_v2pro.py","--gpt_model",str(a.gpt.resolve()),"--sovits_model",str(a.sovits.resolve()),
+        command=common+[str(Path(__file__).resolve().parent/'run_v2pp_export_compat.py'),
+          "--upstream-script",str(upstream/'GPT_SoVITS/stream_v2pro.py'),"--gpt_model",str(a.gpt.resolve()),"--sovits_model",str(a.sovits.resolve()),
           "--ref_audio",str(a.reference.resolve()),"--ref_text",a.prompt,"--output_path",str(output),"--device","cpu",
           "--version",profile.id,"--no-half","--lang",a.language]
     elif profile.cpu_exporter == 'torchscript_legacy':
