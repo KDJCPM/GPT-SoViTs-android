@@ -33,6 +33,8 @@ object QnnV2ppRuntime {
     private const val acceptanceCacheCapacity = 512
     private const val acceptanceLayers = 24
     private const val acceptanceHidden = 512
+    private const val minimumSemanticIterations = 11
+    private const val maximumQualityAttempts = 3
 
     private data class TensorContract(
         val name: String,
@@ -253,54 +255,57 @@ object QnnV2ppRuntime {
             } else {
                 runtimeReferenceCacheValid(runtimeReference.promptPhoneIds.size, phoneIds.size)
             }
-            val semantics = runSteps(
-                environment,
-                model.runtimeFile(graphs.getString("t2s_step")),
-                prefill,
-                activePromptSemantic,
-                activePromptSemantic.size,
-                activeCompactLength,
-                semanticCapacity,
-                request.options,
-                segmentSeed(request.seed, segmentIndex),
-                cacheCapacity,
-                layers,
-                hidden,
-                eosToken,
-                initialCacheValid,
-            )
-            val audio = if (runtimeReference == null) {
-                runVits(
+            val attempts = if (request.seed >= 0) 1 else maximumQualityAttempts
+            repeat(attempts) { attempt ->
+                val attemptSeed = segmentSeed(request.seed, segmentIndex)
+                val semantics = runSteps(
                     environment,
-                    model,
-                    vitsStages,
-                    phoneIds,
-                    semantics,
-                    segmentSeed(request.seed, segmentIndex),
-                    phoneCapacity,
+                    model.runtimeFile(graphs.getString("t2s_step")),
+                    prefill,
+                    activePromptSemantic,
+                    activePromptSemantic.size,
+                    activeCompactLength,
                     semanticCapacity,
-                    samplesPerSemantic,
-                    paddedInputs,
+                    request.options,
+                    attemptSeed,
+                    cacheCapacity,
+                    layers,
+                    hidden,
+                    eosToken,
+                    initialCacheValid,
                 )
-            } else {
-                runReferenceVits(
-                    environment,
-                    model,
-                    referenceVitsStages,
-                    phoneIds,
-                    semantics,
-                    runtimeReference.referenceSpectrogram,
-                    runtimeReference.speakerEmbedding,
-                    segmentSeed(request.seed, segmentIndex),
-                    phoneCapacity,
-                    semanticCapacity,
-                    samplesPerSemantic,
-                )
+                val audio = if (runtimeReference == null) {
+                    runVits(
+                        environment, model, vitsStages, phoneIds, semantics, attemptSeed,
+                        phoneCapacity, semanticCapacity, samplesPerSemantic, paddedInputs,
+                    )
+                } else {
+                    runReferenceVits(
+                        environment, model, referenceVitsStages, phoneIds, semantics,
+                        runtimeReference.referenceSpectrogram, runtimeReference.speakerEmbedding,
+                        attemptSeed, phoneCapacity, semanticCapacity, samplesPerSemantic,
+                    )
+                }
+                val pcm = ShortArray(audio.size) { index ->
+                    (audio[index].coerceIn(-1.0f, 1.0f) * 32767.0f)
+                        .toInt().coerceIn(-32768, 32767).toShort()
+                }
+                if (isUsablePcm(pcm)) return pcm
+                Log.w(tag, "QNN attempt ${attempt + 1}/$attempts produced low-amplitude PCM; resampling")
             }
-            return ShortArray(audio.size) { index ->
-                (audio[index].coerceIn(-1.0f, 1.0f) * 32767.0f)
-                    .toInt().coerceIn(-32768, 32767).toShort()
+            error("QNN executor produced low-amplitude PCM after $attempts sampling attempt(s)")
+        }
+
+        private fun isUsablePcm(pcm: ShortArray): Boolean {
+            if (pcm.isEmpty()) return false
+            var peak = 0
+            var sumSquares = 0.0
+            pcm.forEach { sample ->
+                val value = sample.toInt()
+                peak = maxOf(peak, kotlin.math.abs(value))
+                sumSquares += value.toDouble() * value
             }
+            return peak > 100 && sqrt(sumSquares / pcm.size) > 20.0
         }
 
         private fun prepareRuntimeReference(reference: ReferenceInput): RuntimeReference {
@@ -712,7 +717,12 @@ object QnnV2ppRuntime {
                         "reference_pcm_32k_reflected" to pcm32Tensor,
                     )
                 ).use { outputs ->
-                    ReferenceConditioning(outputs.half(0), outputs.half(1))
+                    // Component compilation is permitted to reorder graph outputs.  Bind
+                    // reference tensors by their exported names, never result position.
+                    ReferenceConditioning(
+                        spectrogram = outputs.half("reference_spectrogram"),
+                        speakerEmbedding = outputs.half("speaker_embedding"),
+                    )
                 }
             }
         }
@@ -865,7 +875,17 @@ object QnnV2ppRuntime {
         var logits = prefill.logits
         var validLength = 0
         for (iteration in 0 until semanticCapacity) {
-            val token = sampleToken(logits, previous, random, options, eosToken)
+            // V2 Pro Plus's infer_panel_naive excludes EOS for its first 11 decoding
+            // iterations.  Without this, a valid early EOS can produce an unusably short
+            // semantic sequence and effectively silent audio.
+            val token = sampleToken(
+                logits,
+                previous,
+                random,
+                options,
+                eosToken,
+                excludeEos = iteration < minimumSemanticIterations,
+            )
             if (token == eosToken) break
             generated[iteration] = token
             validLength++
@@ -1365,6 +1385,7 @@ object QnnV2ppRuntime {
         random: Random,
         options: SynthesisOptions = SynthesisOptions(),
         eosToken: Int = acceptanceEos,
+        excludeEos: Boolean = false,
     ): Int {
         require(logits.size == eosToken + 1)
         val adjusted = logits.copyOf()
@@ -1377,6 +1398,7 @@ object QnnV2ppRuntime {
                 }
             }
         }
+        if (excludeEos) adjusted[eosToken] = Float.NEGATIVE_INFINITY
         if (options.temperature == 0.0f) return argmax(adjusted)
         for (index in adjusted.indices) adjusted[index] /= options.temperature
         val top = IntArray(options.topK.coerceAtMost(adjusted.size)) { -1 }
@@ -1464,6 +1486,13 @@ object QnnV2ppRuntime {
 
     private fun OrtSession.Result.half(index: Int): ShortArray {
         val buffer = (this[index] as OnnxTensor).shortBuffer
+        return ShortArray(buffer.remaining()).also { buffer.get(it) }
+    }
+
+    private fun OrtSession.Result.half(name: String): ShortArray {
+        val tensor = this.asSequence().firstOrNull { it.key == name }?.value as? OnnxTensor
+            ?: error("QNN session did not return FLOAT16 output $name")
+        val buffer = tensor.shortBuffer
         return ShortArray(buffer.remaining()).also { buffer.get(it) }
     }
 

@@ -145,6 +145,9 @@ class MainActivity : ComponentActivity() {
             pipelineInstalled = ModelPackage.hasInstalledPipeline(this),
             installedVersions = ModelPackage.installedPipelineVersions(this),
             qnnPipelines = installedQnnPipelines(),
+            selectedPipelineVersion = selectedInstalledPipelineVersion(
+                ModelPackage.installedPipelineVersions(this),
+            ),
             componentUrl = prefs.getString("pipeline_url_v2pp", null) ?: ComponentVersion.V2PP.defaultUrl,
             showFirstRun = savedInstanceState?.getBoolean(STATE_SHOW_FIRST_RUN)
                 ?: !ModelPackage.hasInstalledPipeline(this),
@@ -268,7 +271,14 @@ class MainActivity : ComponentActivity() {
             }
                 .onSuccess {
                     val installed = ModelPackage.installedPipelineVersions(this@MainActivity)
-                    ui = ui.copy(busy = false, pipelineInstalled = installed.isNotEmpty(), installedVersions = installed, showFirstRun = false, status = getString(R.string.pipeline_installed_versions, it.joinToString { item -> item.version }))
+                    ui = ui.copy(
+                        busy = false,
+                        pipelineInstalled = installed.isNotEmpty(),
+                        installedVersions = installed,
+                        selectedPipelineVersion = selectedInstalledPipelineVersion(installed),
+                        showFirstRun = false,
+                        status = getString(R.string.pipeline_installed_versions, it.joinToString { item -> item.version }),
+                    )
                 }
                 .onFailure { ui = ui.copy(busy = false, status = getString(R.string.pipeline_import_failed, it.message.orEmpty())) }
         }
@@ -281,12 +291,16 @@ class MainActivity : ComponentActivity() {
             runCatching {
                 withContext(Dispatchers.IO) {
                     val version = inspectPipelineVersion(uri)
+                    require(version == ui.selectedPipelineVersion) {
+                        getString(R.string.pipeline_attachment_version_mismatch, version)
+                    }
                     ModelPackage.installQnnPipelineAttachment(this@MainActivity, uri, version)
                 }
             }.onSuccess { attachment ->
                 ui = ui.copy(
                     busy = false,
                     qnnPipelines = installedQnnPipelines(),
+                    selectedPipelineVersion = attachment.version,
                     status = getString(
                         R.string.qnn_pipeline_installed,
                         attachment.version,
@@ -307,6 +321,22 @@ class MainActivity : ComponentActivity() {
             "${version.manifestId}:$target"
         }
     }
+
+    private fun selectedInstalledPipelineVersion(installed: Set<String>): String? {
+        val saved = getSharedPreferences("components", MODE_PRIVATE).getString("selected_pipeline_version", null)
+        return saved?.takeIf { it in installed }
+            ?: ComponentVersion.entries.firstOrNull { it.manifestId in installed }?.manifestId
+    }
+
+    private fun selectInstalledPipeline(version: ComponentVersion) {
+        if (version.manifestId !in ui.installedVersions || ui.busy) return
+        getSharedPreferences("components", MODE_PRIVATE)
+            .edit().putString("selected_pipeline_version", version.manifestId).apply()
+        ui = ui.copy(selectedPipelineVersion = version.manifestId, status = "")
+    }
+
+    private fun hasQnnPipeline(version: ComponentVersion): Boolean =
+        ui.qnnPipelines.any { it.substringBefore(':') == version.manifestId }
 
     private fun inspectPipelineVersion(uri: Uri): String = contentResolver.openInputStream(uri).use { raw ->
         requireNotNull(raw) { getString(R.string.pipeline_open_failed) }
@@ -341,11 +371,142 @@ class MainActivity : ComponentActivity() {
                 }
             }.onSuccess {
                 val installed = ModelPackage.installedPipelineVersions(this@MainActivity)
-                ui = ui.copy(busy = false, downloadProgress = null, pipelineInstalled = installed.isNotEmpty(), installedVersions = installed, showFirstRun = false, status = getString(R.string.pipeline_install_complete, versions.joinToString { it.label }))
+                ui = ui.copy(
+                    busy = false,
+                    downloadProgress = null,
+                    pipelineInstalled = installed.isNotEmpty(),
+                    installedVersions = installed,
+                    selectedPipelineVersion = selectedInstalledPipelineVersion(installed),
+                    showFirstRun = false,
+                    status = getString(R.string.pipeline_install_complete, versions.joinToString { it.label }),
+                )
             }.onFailure {
                 val installed = ModelPackage.installedPipelineVersions(this@MainActivity)
                 ui = ui.copy(busy = false, downloadProgress = null, pipelineInstalled = installed.isNotEmpty(), installedVersions = installed, status = getString(R.string.pipeline_download_failed, it.message.orEmpty()))
             }
+        }
+    }
+
+    private fun installRecommendedFirefly() {
+        if (!hasExternalModelAccess()) {
+            ui = ui.copy(status = getString(R.string.external_models_permission_required))
+            requestExternalModelScan()
+            return
+        }
+        val target = QualcommTargetSoc.detect()
+        if (target == null) {
+            ui = ui.copy(status = getString(R.string.recommended_qnn_unsupported_device))
+            return
+        }
+        setBusy(getString(R.string.recommended_install_preparing, target.displayName))
+        ui = ui.copy(downloadProgress = 0f)
+        lifecycleScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val directory = externalModelDirectory().also { require(it.exists() || it.mkdirs()) }
+                    val artifacts = listOf(
+                        ReleaseArtifact.CPU_PIPELINE,
+                        ReleaseArtifact.CPU_FIREFLY,
+                        ReleaseArtifact.qnnPipeline(target),
+                        ReleaseArtifact.qnnFirefly(target),
+                    )
+                    val files = artifacts.mapIndexed { index, artifact ->
+                        downloadReleaseArtifact(directory, artifact, index, artifacts.size)
+                    }
+                    val cpuPipeline = files[0]
+                    val cpuModel = files[1]
+                    val qnnPipeline = files[2]
+                    val qnnModel = files[3]
+                    ModelPackage.installPipeline(this@MainActivity, Uri.fromFile(cpuPipeline), ComponentVersion.V2PP.manifestId)
+                    val cpu = ModelPackage.importModelWithInstalledPipeline(this@MainActivity, Uri.fromFile(cpuModel))
+                    ModelPackage.installQnnPipelineAttachment(this@MainActivity, Uri.fromFile(qnnPipeline), ComponentVersion.V2PP.manifestId)
+                    val paired = ModelPackage.importQnnModelWithInstalledPipeline(
+                        this@MainActivity,
+                        Uri.fromFile(cpuModel),
+                        Uri.fromFile(qnnModel),
+                    )
+                    synchronized(engineLock) { engine.load(paired) }
+                    cpu to paired
+                }
+            }.onSuccess { (cpu, paired) ->
+                val record = ModelRecord(
+                    uri = Uri.fromFile(File(externalModelDirectory(), ReleaseArtifact.CPU_FIREFLY.fileName)).toString(),
+                    name = cpu.name,
+                    version = cpu.version,
+                    split = true,
+                    qnnUri = Uri.fromFile(File(externalModelDirectory(), ReleaseArtifact.qnnFirefly(target).fileName)).toString(),
+                    baseModelSha256 = paired.baseModelSha256,
+                )
+                saveModelRecord(record)
+                val installed = ModelPackage.installedPipelineVersions(this@MainActivity)
+                ui = ui.copy(
+                    busy = false,
+                    downloadProgress = null,
+                    pipelineInstalled = installed.isNotEmpty(),
+                    installedVersions = installed,
+                    qnnPipelines = installedQnnPipelines(),
+                    selectedPipelineVersion = ComponentVersion.V2PP.manifestId,
+                    modelInfo = "${paired.name} / ${paired.version} / ${paired.sampleRate} Hz",
+                    backend = engine.backendName,
+                    runtimeOptions = engine.loadedPackage?.runtimeOptions ?: emptySet(),
+                    referenceOverrideSupported = engine.loadedPackage?.referenceInputVersion?.let { it >= 1 } ?: false,
+                    status = getString(R.string.recommended_install_complete, target.displayName),
+                )
+            }.onFailure { error ->
+                ui = ui.copy(
+                    busy = false,
+                    downloadProgress = null,
+                    status = getString(R.string.recommended_install_failed, error.message.orEmpty()),
+                )
+            }
+        }
+    }
+
+    private suspend fun downloadReleaseArtifact(
+        directory: File,
+        artifact: ReleaseArtifact,
+        index: Int,
+        count: Int,
+    ): File {
+        val destination = File(directory, artifact.fileName)
+        if (destination.isFile && fileSha256(destination) == artifact.sha256) return destination
+        val partial = File(directory, "${artifact.fileName}.partial")
+        try {
+            val connection = URL(artifact.url).openConnection() as HttpURLConnection
+            connection.instanceFollowRedirects = true
+            connection.connectTimeout = 20_000
+            connection.readTimeout = 60_000
+            connection.setRequestProperty("User-Agent", "GSV-Mobile/3")
+            try {
+                require(connection.responseCode in 200..299) { getString(R.string.download_http_failed, connection.responseCode) }
+                val total = connection.contentLengthLong
+                connection.inputStream.buffered().use { input ->
+                    partial.outputStream().buffered().use { output ->
+                        val buffer = ByteArray(1024 * 1024)
+                        var received = 0L
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            output.write(buffer, 0, read)
+                            received += read
+                            if (total > 0) withContext(Dispatchers.Main) {
+                                ui = ui.copy(
+                                    downloadProgress = (index + received.toFloat() / total) / count,
+                                    status = getString(R.string.recommended_downloading, artifact.fileName, received / 1024 / 1024, total / 1024 / 1024),
+                                )
+                            }
+                        }
+                    }
+                }
+            } finally {
+                connection.disconnect()
+            }
+            require(fileSha256(partial) == artifact.sha256) { getString(R.string.download_sha_mismatch) }
+            if (destination.exists()) require(destination.delete()) { getString(R.string.download_persist_failed) }
+            require(partial.renameTo(destination)) { getString(R.string.download_persist_failed) }
+            return destination
+        } finally {
+            if (partial.exists()) partial.delete()
         }
     }
 
@@ -422,7 +583,17 @@ class MainActivity : ComponentActivity() {
             return
         }
         val message = getString(if (split) R.string.model_loading else R.string.model_importing)
+        val selectedPipelineVersion = ui.selectedPipelineVersion
         loadPackage(message, importer = {
+            if (split && selectedPipelineVersion != null) {
+                val version = contentResolver.openInputStream(uri).use { input ->
+                    requireNotNull(input) { getString(R.string.pipeline_open_failed) }
+                    ModelPackage.inspectManifest(input).getString("model_version")
+                }
+                require(version == selectedPipelineVersion) {
+                    getString(R.string.voice_model_pipeline_mismatch, version)
+                }
+            }
             if (split) ModelPackage.importModelWithInstalledPipeline(this, uri) else ModelPackage.import(this, uri)
         }) { model ->
             if (remember) saveModelRecord(ModelRecord(uri.toString(), model.name, model.version, split))
@@ -465,6 +636,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadModelRecord(record: ModelRecord) {
+        ComponentVersion.entries.firstOrNull { it.manifestId == record.version }?.let(::selectInstalledPipeline)
         val qnn = record.qnnUri
         if (qnn.isNullOrBlank()) {
             loadModelUri(Uri.parse(record.uri), record.split, remember = false)
@@ -733,264 +905,34 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable private fun MainScreen() {
-        var tab by rememberSaveable { mutableIntStateOf(0) }
-        Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.app_name)) }, actions = { IconButton(onClick = { tab = 2 }) { Icon(Icons.Default.Settings, stringResource(R.string.settings)) } }) }) { padding ->
-            Column(Modifier.padding(padding).fillMaxSize()) {
-                PrimaryTabRow(tab) {
-                    Tab(tab == 0, { tab = 0 }, text = { Text(stringResource(R.string.tab_synthesis)) })
-                    Tab(tab == 1, { tab = 1 }, text = { Text(stringResource(R.string.tab_models)) })
-                    Tab(tab == 2, { tab = 2 }, text = { Text(stringResource(R.string.tab_settings)) })
-                    Tab(tab == 3, { tab = 3 }, text = { Text(stringResource(R.string.tab_about)) })
-                }
-                when (tab) { 0 -> SynthesisPane(); 1 -> ModelLibraryPane(); 2 -> SettingsPane(); else -> AboutPane() }
-            }
-        }
-        if (ui.showFirstRun) ComponentDialog()
-    }
-
-    @Composable private fun ComponentDialog() {
-        AlertDialog(
-            onDismissRequest = { if (!ui.busy) ui = ui.copy(showFirstRun = false) },
-            title = { Text(stringResource(R.string.pipeline_choose_title)) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(stringResource(R.string.pipeline_versions_required), style = MaterialTheme.typography.labelLarge)
-                    ComponentVersion.entries.forEach { version ->
-                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Checkbox(version in ui.selectedVersions, { checked ->
-                                val next = if (checked) ui.selectedVersions + version else ui.selectedVersions - version
-                                if (next.isNotEmpty()) ui = ui.copy(selectedVersions = next)
-                            })
-                            Column { Text(version.label); Text(stringResource(if (version.manifestId in ui.installedVersions) R.string.installed else R.string.not_installed), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                        }
-                    }
-                    ui.downloadProgress?.let { LinearProgressIndicator(progress = { it }, modifier = Modifier.fillMaxWidth()) }
-                    if (ui.pipelineInstalled) {
-                        OutlinedButton(
-                            { ui = ui.copy(showFirstRun = false); pickQnnPipelineAttachment.launch(qnnPackageTypes) },
-                            enabled = !ui.busy,
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Icon(Icons.Default.UploadFile, null)
-                            Spacer(Modifier.width(8.dp))
-                            Text(stringResource(R.string.import_qnn_pipeline_attachment))
-                        }
-                    }
-                }
-            },
-            confirmButton = { Button(::downloadPipelines, enabled = !ui.busy && ui.selectedVersions.isNotEmpty()) { Icon(Icons.Default.Download, null); Spacer(Modifier.width(8.dp)); Text(if (ui.selectedVersions.size > 1) stringResource(R.string.download_count, ui.selectedVersions.size) else stringResource(R.string.download_component)) } },
-            dismissButton = { Row { TextButton(onClick = { ui = ui.copy(showFirstRun = false); pickPipelines.launch(packageTypes) }, enabled = !ui.busy) { Text(stringResource(R.string.import_manually)) }; TextButton(onClick = { ui = ui.copy(showFirstRun = false) }, enabled = !ui.busy) { Text(stringResource(R.string.later)) } } },
+        GsvAppUi(
+            state = ui,
+            onStateChange = { ui = it },
+            onSynthesize = ::synthesize,
+            onPlay = ::play,
+            onSave = ::save,
+            onPickReference = { pickReference.launch(arrayOf("audio/*", "audio/wav", "audio/flac", "audio/mpeg")) },
+            onInstallFirefly = ::installRecommendedFirefly,
+            onSelectPipeline = ::selectInstalledPipeline,
+            onInstallPipelines = { ui = ui.copy(showFirstRun = true) },
+            onPickPipeline = { pickPipelines.launch(packageTypes) },
+            onPickQnnPipeline = { pickQnnPipelineAttachment.launch(qnnPackageTypes) },
+            onPickModel = { pickModel.launch(packageTypes) },
+            onPickCombined = { pickCombined.launch(packageTypes) },
+            onScan = ::requestExternalModelScan,
+            onChooseQnnModel = ::chooseQnnModelAttachment,
+            onLoadModel = ::loadModelRecord,
+            onRemoveQnnModel = { saveModelRecord(it.copy(qnnUri = null, baseModelSha256 = null)) },
+            onOpenConverter = { openWebsite(MODEL_CONVERTER_URL) },
+            onOpenProject = { openWebsite(PROJECT_URL) },
+            onOpenUpstream = { openWebsite(UPSTREAM_URL) },
+            onSelectLanguage = ::selectAppLanguage,
+            onStartApi = ::startApiServer,
+            onStopApi = ::stopApiServer,
+            onDownloadPipelines = ::downloadPipelines,
         )
     }
 
-    @Composable private fun SynthesisPane() {
-        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Text(ui.backend, style = MaterialTheme.typography.titleMedium)
-            Text(ui.modelInfo, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            OutlinedTextField(ui.text, { ui = ui.copy(text = it) }, label = { Text(stringResource(R.string.input_text)) }, minLines = 5, modifier = Modifier.fillMaxWidth())
-            Text(stringResource(R.string.text_language), style = MaterialTheme.typography.labelLarge)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("auto" to R.string.language_auto, "zh" to R.string.language_chinese, "en" to R.string.language_english).forEach { (value, label) ->
-                    FilterChip(ui.textLanguage == value, { ui = ui.copy(textLanguage = value) }, { Text(stringResource(label)) })
-                }
-            }
-            Text(stringResource(R.string.reference_voice), style = MaterialTheme.typography.titleMedium)
-            Text(
-                if (ui.referenceUri == null) stringResource(R.string.reference_model_preset) else stringResource(R.string.reference_temporary, ui.referenceName),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton({ pickReference.launch(arrayOf("audio/*", "audio/wav", "audio/flac", "audio/mpeg")) }, enabled = !ui.busy && ui.referenceOverrideSupported, modifier = Modifier.weight(1f)) {
-                    Icon(Icons.Default.UploadFile, null); Spacer(Modifier.width(6.dp)); Text(stringResource(R.string.reference_choose_audio))
-                }
-                TextButton({ ui = ui.copy(referenceUri = null, referenceName = "", referencePrompt = "") }, enabled = !ui.busy && ui.referenceUri != null) { Text(stringResource(R.string.reference_use_preset)) }
-            }
-            if (ui.referenceUri != null) {
-                OutlinedTextField(ui.referencePrompt, { ui = ui.copy(referencePrompt = it) }, label = { Text(stringResource(R.string.reference_prompt)) }, minLines = 2, modifier = Modifier.fillMaxWidth())
-                Text(stringResource(R.string.reference_language), style = MaterialTheme.typography.labelLarge)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("auto" to R.string.language_auto, "zh" to R.string.language_chinese, "en" to R.string.language_english).forEach { (value, label) ->
-                        FilterChip(ui.referenceLanguage == value, { ui = ui.copy(referenceLanguage = value) }, { Text(stringResource(label)) })
-                    }
-                }
-                if (!ui.referenceOverrideSupported) Text(stringResource(R.string.reference_not_supported), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-            }
-            ui.referenceExactPcm16kSamples?.let { samples ->
-                Text(
-                    stringResource(R.string.reference_exact_duration_required, samples / 16000.0),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-            Text(stringResource(R.string.generation_options), style = MaterialTheme.typography.titleMedium)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                NumberField(stringResource(R.string.temperature), ui.temperature, { ui = ui.copy(temperature = it) }, Modifier.weight(1f), "temperature" in ui.runtimeOptions)
-                NumberField(stringResource(R.string.top_p), ui.topP, { ui = ui.copy(topP = it) }, Modifier.weight(1f), "top_p" in ui.runtimeOptions)
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                NumberField(stringResource(R.string.top_k), ui.topK, { ui = ui.copy(topK = it) }, Modifier.weight(1f), "top_k" in ui.runtimeOptions)
-                NumberField(stringResource(R.string.repetition_penalty), ui.penalty, { ui = ui.copy(penalty = it) }, Modifier.weight(1f), "repetition_penalty" in ui.runtimeOptions)
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                NumberField(stringResource(R.string.speed), ui.speed, { ui = ui.copy(speed = it) }, Modifier.weight(1f), "speed_factor" in ui.runtimeOptions)
-                NumberField(stringResource(R.string.cfm_steps), ui.steps, { ui = ui.copy(steps = it) }, Modifier.weight(1f), "sample_steps" in ui.runtimeOptions)
-            }
-            Button(::synthesize, enabled = !ui.busy && ui.text.isNotBlank(), modifier = Modifier.fillMaxWidth()) { Text(if (ui.busy) stringResource(R.string.processing) else stringResource(R.string.synthesize_speech)) }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(::play, enabled = ui.canPlay && !ui.busy, modifier = Modifier.weight(1f)) { Icon(Icons.Default.PlayArrow, null); Spacer(Modifier.width(8.dp)); Text(stringResource(R.string.play)) }
-                OutlinedButton(::save, enabled = ui.canPlay && !ui.busy, modifier = Modifier.weight(1f)) { Icon(Icons.Default.SaveAlt, null); Spacer(Modifier.width(8.dp)); Text(stringResource(R.string.save_audio)) }
-            }
-            if (ui.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-            if (ui.status.isNotBlank()) Text(ui.status, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-    }
-
-    @Composable private fun ModelLibraryPane() {
-        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-            Text(stringResource(R.string.pipeline_components), style = MaterialTheme.typography.titleMedium)
-            Text(
-                if (ui.installedVersions.isEmpty()) stringResource(R.string.not_installed) else stringResource(R.string.pipeline_installed_versions, ComponentVersion.entries.filter { it.manifestId in ui.installedVersions }.joinToString { it.shortLabel }),
-                color = if (ui.pipelineInstalled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
-            )
-            Text(
-                if (ui.qnnPipelines.isEmpty()) stringResource(R.string.qnn_pipeline_not_installed) else stringResource(R.string.qnn_pipeline_targets, ui.qnnPipelines.sorted().joinToString()),
-                style = MaterialTheme.typography.bodySmall,
-                color = if (ui.qnnPipelines.isEmpty()) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.primary,
-            )
-            OutlinedButton(
-                { pickQnnPipelineAttachment.launch(qnnPackageTypes) },
-                enabled = !ui.busy && ui.pipelineInstalled,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Icon(Icons.Default.UploadFile, null)
-                Spacer(Modifier.width(8.dp))
-                Text(stringResource(R.string.import_qnn_pipeline_attachment))
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button({ if (ui.pipelineInstalled) pickModel.launch(packageTypes) else ui = ui.copy(showFirstRun = true) }, enabled = !ui.busy, modifier = Modifier.weight(1f)) { Icon(Icons.Default.UploadFile, null); Spacer(Modifier.width(6.dp)); Text(stringResource(R.string.add_voice_model)) }
-                OutlinedButton({ pickCombined.launch(packageTypes) }, enabled = !ui.busy, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.add_complete_package)) }
-            }
-            Text(stringResource(R.string.external_model_directory), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            OutlinedButton(::requestExternalModelScan, enabled = !ui.busy, modifier = Modifier.fillMaxWidth()) {
-                Icon(Icons.Default.Refresh, null)
-                Spacer(Modifier.width(8.dp))
-                Text(stringResource(R.string.scan_external_models))
-            }
-            TextButton({ openWebsite(MODEL_CONVERTER_URL) }) {
-                Text(stringResource(R.string.how_get_gsvm))
-                Spacer(Modifier.width(6.dp))
-                Icon(Icons.AutoMirrored.Filled.OpenInNew, stringResource(R.string.open_in_browser))
-            }
-            Text(
-                stringResource(R.string.legacy_model_unsupported),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            HorizontalDivider()
-            Text(stringResource(R.string.model_library), style = MaterialTheme.typography.titleLarge)
-            if (ui.models.isEmpty()) {
-                Text(stringResource(R.string.no_models), color = MaterialTheme.colorScheme.onSurfaceVariant)
-            } else ui.models.forEach { record ->
-                val expanded = ui.expandedModelUri == record.uri
-                Surface(tonalElevation = 1.dp, shape = MaterialTheme.shapes.small, modifier = Modifier.fillMaxWidth().animateContentSize()) {
-                    Column {
-                        Row(
-                            Modifier.fillMaxWidth().clickable { ui = ui.copy(expandedModelUri = if (expanded) null else record.uri) }.padding(horizontal = 12.dp, vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text(record.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
-                            Text(record.version, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Icon(if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore, stringResource(if (expanded) R.string.collapse else R.string.expand))
-                        }
-                        if (expanded) {
-                            HorizontalDivider()
-                            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Text(stringResource(if (record.split) R.string.split_voice_model else R.string.complete_package), style = MaterialTheme.typography.bodySmall)
-                                Text(Uri.decode(record.uri), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                Text(
-                                    stringResource(if (record.qnnUri == null) R.string.qnn_attachment_not_selected else R.string.qnn_attachment_selected),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = if (record.qnnUri == null) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.primary,
-                                )
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
-                                ) {
-                                    OutlinedButton({ chooseQnnModelAttachment(record) }, enabled = !ui.busy) {
-                                        Text(stringResource(R.string.choose_qnn_attachment))
-                                    }
-                                    Button({ loadModelRecord(record) }, enabled = !ui.busy) {
-                                        Text(stringResource(if (record.qnnUri == null) R.string.load_model else R.string.load_model_npu))
-                                    }
-                                }
-                                if (record.qnnUri != null) {
-                                    TextButton(
-                                        { saveModelRecord(record.copy(qnnUri = null, baseModelSha256 = null)) },
-                                        enabled = !ui.busy,
-                                        modifier = Modifier.align(Alignment.End),
-                                    ) { Text(stringResource(R.string.remove_qnn_attachment)) }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if (ui.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-            if (ui.status.isNotBlank()) Text(ui.status, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-    }
-
-    @Composable private fun SettingsPane() {
-        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
-            Text(stringResource(R.string.app_language), style = MaterialTheme.typography.titleLarge)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(
-                    selected = ui.appLanguage == AppLanguage.CHINESE,
-                    onClick = { selectAppLanguage(AppLanguage.CHINESE) },
-                    label = { Text(stringResource(R.string.app_language_chinese)) },
-                    enabled = !ui.busy,
-                )
-                FilterChip(
-                    selected = ui.appLanguage == AppLanguage.ENGLISH,
-                    onClick = { selectAppLanguage(AppLanguage.ENGLISH) },
-                    label = { Text(stringResource(R.string.app_language_english)) },
-                    enabled = !ui.busy,
-                )
-            }
-            HorizontalDivider()
-            Text(stringResource(R.string.pipeline_components), style = MaterialTheme.typography.titleLarge)
-            Text(if (ui.installedVersions.isEmpty()) stringResource(R.string.not_installed) else stringResource(R.string.pipeline_installed_versions, ComponentVersion.entries.filter { it.manifestId in ui.installedVersions }.joinToString { it.shortLabel }), color = if (ui.pipelineInstalled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
-            Button({ ui = ui.copy(showFirstRun = true) }, enabled = !ui.busy) { Icon(Icons.Default.UploadFile, null); Spacer(Modifier.width(8.dp)); Text(stringResource(if (ui.pipelineInstalled) R.string.change_components else R.string.choose_import_components)) }
-            OutlinedButton({ pickQnnPipelineAttachment.launch(qnnPackageTypes) }, enabled = !ui.busy && ui.pipelineInstalled) { Icon(Icons.Default.UploadFile, null); Spacer(Modifier.width(8.dp)); Text(stringResource(R.string.import_qnn_pipeline_attachment)) }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { ComponentVersion.entries.forEach { version -> FilterChip(ui.componentVersion == version, { selectComponentVersion(version) }, { Text(version.shortLabel) }) } }
-            OutlinedTextField(ui.componentUrl, { value -> ui = ui.copy(componentUrl = value); getSharedPreferences("components", MODE_PRIVATE).edit().putString(ui.componentVersion.preferenceKey, value).apply() }, label = { Text(stringResource(R.string.component_download_url, ui.componentVersion.label)) }, leadingIcon = { Icon(Icons.Default.Download, null) }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-            HorizontalDivider()
-            Text(stringResource(R.string.openai_local_api), style = MaterialTheme.typography.titleLarge)
-            OutlinedTextField(ui.port, { ui = ui.copy(port = it) }, enabled = !ui.serverEnabled, label = { Text(stringResource(R.string.port)) }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
-            Row(verticalAlignment = Alignment.CenterVertically) { Switch(ui.serverEnabled, { if (it) startApiServer() else stopApiServer() }); Spacer(Modifier.width(12.dp)); Text(stringResource(if (ui.serverEnabled) R.string.api_enabled else R.string.enable_api)) }
-            Text(ui.serverStatus, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-    }
-
-    @Composable private fun AboutPane() {
-        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineSmall)
-            Text(stringResource(R.string.about_description), color = MaterialTheme.colorScheme.onSurfaceVariant)
-            HorizontalDivider()
-            Text(stringResource(R.string.project_links), style = MaterialTheme.typography.titleMedium)
-            OutlinedButton({ openWebsite(PROJECT_URL) }, modifier = Modifier.fillMaxWidth()) {
-                Text(stringResource(R.string.project_name), modifier = Modifier.weight(1f))
-                Icon(Icons.AutoMirrored.Filled.OpenInNew, stringResource(R.string.open_in_browser))
-            }
-            OutlinedButton({ openWebsite(UPSTREAM_URL) }, modifier = Modifier.fillMaxWidth()) {
-                Text(stringResource(R.string.upstream_project), modifier = Modifier.weight(1f))
-                Icon(Icons.AutoMirrored.Filled.OpenInNew, stringResource(R.string.open_in_browser))
-            }
-            Text(stringResource(R.string.license_notice), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-    }
-
-    @Composable private fun NumberField(label: String, value: String, change: (String) -> Unit, modifier: Modifier, enabled: Boolean) = OutlinedTextField(value, change, modifier, enabled = enabled, label = { Text(label) }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
     override fun onDestroy() {
         player?.release()
         GsvRuntime.releaseActivity(isFinishing)
@@ -1038,10 +980,31 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private data class UiState(
+private const val RELEASE_REPOSITORY = "https://hf-mirror.com/tuxjhtd/GPT-Sovits_pipeline_Torchscript/resolve/main/"
+
+private data class ReleaseArtifact(val fileName: String, val sha256: String) {
+    val url: String get() = "$RELEASE_REPOSITORY$fileName?download=true"
+
+    companion object {
+        val CPU_PIPELINE = ReleaseArtifact("v2pp-cpu-pipeline.gsvm", "7fcbc0bb520fa9c3eedd1ccccace443ced2185b8ca1ab2c915fd764f5e6656d7")
+        val CPU_FIREFLY = ReleaseArtifact("firefly-v2pp-cpu.gsvm", "cc6fb5cdd51e0d4638de1d018a7fcbf642fb0f0b4540770a15f02f167ceeb3af")
+        fun qnnPipeline(target: QualcommTargetSoc): ReleaseArtifact = when (target) {
+            QualcommTargetSoc.SNAPDRAGON_8_GEN_3 -> ReleaseArtifact("v2pp-sm8650-pipeline.qnn.gsvm", "933af9777eb5095d46b904cfb083922acf76e2e7c645b7533ac295d01c5700c8")
+            QualcommTargetSoc.SNAPDRAGON_8_ELITE -> ReleaseArtifact("v2pp-sm8750-pipeline.qnn.gsvm", "d3805f7c8de4db2bb733a5737aea7404d81133ef3d4c8caf1a272f6943e6fe7a")
+            QualcommTargetSoc.SNAPDRAGON_8_ELITE_GEN_5 -> ReleaseArtifact("v2pp-sm8850-pipeline.qnn.gsvm", "a90d92bb80cebd276e1f7d42887aefb396549d6579de3f0ff8049a5a345ac172")
+        }
+        fun qnnFirefly(target: QualcommTargetSoc): ReleaseArtifact = when (target) {
+            QualcommTargetSoc.SNAPDRAGON_8_GEN_3 -> ReleaseArtifact("firefly-v2pp-sm8650.qnn.gsvm", "c35484ad63218af892667a9f2a9de7887f884850c5cb05c4ed2ebefea5206f1a")
+            QualcommTargetSoc.SNAPDRAGON_8_ELITE -> ReleaseArtifact("firefly-v2pp-sm8750.qnn.gsvm", "8ad26fc196f345b24071ee14e5c3aa1c4494119c407edebdba4cee3ec9d55ea4")
+            QualcommTargetSoc.SNAPDRAGON_8_ELITE_GEN_5 -> ReleaseArtifact("firefly-v2pp-sm8850.qnn.gsvm", "b1cdec977f787a0bdc9f9f61f4c83d4754703552430c6ce05c19662a1130beb2")
+        }
+    }
+}
+
+internal data class UiState(
     val pipelineInstalled: Boolean = false, val showFirstRun: Boolean = false, val componentUrl: String = "",
     val componentVersion: ComponentVersion = ComponentVersion.V2PP, val selectedVersions: Set<ComponentVersion> = setOf(ComponentVersion.V2PP),
-    val installedVersions: Set<String> = emptySet(), val qnnPipelines: Set<String> = emptySet(), val downloadProgress: Float? = null,
+    val installedVersions: Set<String> = emptySet(), val qnnPipelines: Set<String> = emptySet(), val selectedPipelineVersion: String? = null, val downloadProgress: Float? = null,
     val models: List<ModelRecord> = emptyList(),
     val expandedModelUri: String? = null,
     val modelInfo: String = "", val backend: String = "", val status: String = "",
@@ -1054,7 +1017,7 @@ private data class UiState(
     val appLanguage: AppLanguage = AppLanguage.ENGLISH,
 )
 
-private data class ModelRecord(
+internal data class ModelRecord(
     val uri: String,
     val name: String,
     val version: String,
@@ -1063,7 +1026,7 @@ private data class ModelRecord(
     val baseModelSha256: String? = null,
 )
 
-private enum class ComponentVersion(
+internal enum class ComponentVersion(
     val label: String,
     val shortLabel: String,
     val manifestId: String,

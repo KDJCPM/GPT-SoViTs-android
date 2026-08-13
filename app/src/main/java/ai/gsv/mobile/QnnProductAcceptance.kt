@@ -28,8 +28,11 @@ object QnnProductAcceptance {
     )
 
     fun run(context: Context, inputs: Inputs, outputRoot: File): String {
-        listOf(inputs.cpuPipeline, inputs.cpuModel, inputs.qnnPipeline, inputs.qnnModel).forEach {
+        listOf(inputs.cpuPipeline, inputs.cpuModel, inputs.qnnPipeline).forEach {
             require(it.isFile) { "acceptance input is missing: $it" }
+        }
+        require(inputs.qnnModel.path == "@installed" || inputs.qnnModel.isFile) {
+            "acceptance QNN model is missing: ${inputs.qnnModel}"
         }
         require(inputs.text.isNotBlank()) { "acceptance text is empty" }
         inputs.referenceAudio?.let {
@@ -43,21 +46,28 @@ object QnnProductAcceptance {
         val apiPresetOutput = File(outputRoot, "openai-preset.wav")
         val apiReferenceOutput = File(outputRoot, "openai-reference.wav")
         try {
-            ModelPackage.installPipeline(
-                context,
-                Uri.fromFile(inputs.cpuPipeline),
-                "v2ProPlus",
-            )
-            val qnnPipeline = ModelPackage.installQnnPipelineAttachment(
-                context,
-                Uri.fromFile(inputs.qnnPipeline),
-                "v2ProPlus",
-            )
-            val model = ModelPackage.importQnnModelWithInstalledPipeline(
-                context,
-                Uri.fromFile(inputs.cpuModel),
-                Uri.fromFile(inputs.qnnModel),
-            )
+            val model = if (inputs.qnnModel.path == "@installed") {
+                ModelPackage.openInstalledQnnModelWithPipeline(
+                    context,
+                    Uri.fromFile(inputs.cpuModel),
+                )
+            } else {
+                ModelPackage.installPipeline(
+                    context,
+                    Uri.fromFile(inputs.cpuPipeline),
+                    "v2ProPlus",
+                )
+                ModelPackage.installQnnPipelineAttachment(
+                    context,
+                    Uri.fromFile(inputs.qnnPipeline),
+                    "v2ProPlus",
+                )
+                ModelPackage.importQnnModelWithInstalledPipeline(
+                    context,
+                    Uri.fromFile(inputs.cpuModel),
+                    Uri.fromFile(inputs.qnnModel),
+                )
+            }
             require(model.executor == "qnn-htp" && model.deployable && model.strictCpuFallback)
             val artifactTarget = QualcommTargetPolicy.requireArtifactIdentity(model)
             val deviceTarget = requireNotNull(QualcommTargetPolicy.current().target) {
@@ -122,7 +132,7 @@ object QnnProductAcceptance {
                 .put("qairt_version", model.qairtVersion)
                 .put("qnn_runtime_version", model.qnnRuntimeVersion)
                 .put("cpu_neural_fallback", false)
-                .put("pipeline_bundle_id", qnnPipeline.bundleId)
+                .put("pipeline_bundle_id", model.bundleId)
                 .put("model_bundle_id", model.bundleId)
                 .put("base_model_sha256", model.baseModelSha256)
                 .put("preset", presetStats.toJson(presetOutput))
