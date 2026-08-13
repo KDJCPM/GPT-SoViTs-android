@@ -35,8 +35,14 @@ def main() -> None:
         '"forward": (y, text_seq, refer, sv_emb, 1.0),',
         '"forward": (y, text_seq, refer, sv_emb, torch.tensor(1.0, device=y.device)),',
     )
+    # User checkpoints are frequently saved with CUDA storage tags.  CPU export must be
+    # deterministic on hosts without CUDA, so remap both GPT checkpoint loads explicitly.
+    source = source.replace("torch.load(gpt_path, weights_only=False)",
+                            "torch.load(gpt_path, map_location=\"cpu\", weights_only=False)")
     sys.argv = [str(script), *remaining]
-    os.chdir(script.parents[1])
+    # The upstream web UI writes a transient weight.json relative to cwd.  Keep the
+    # checkout read-only and allow the dispatcher to provide a writable workspace.
+    os.chdir(os.environ.get("GSV_EXPORT_CWD", str(script.parents[1])))
     namespace = {"__name__": "__main__", "__file__": str(script)}
     exec(compile(source, str(script), "exec"), namespace)
 

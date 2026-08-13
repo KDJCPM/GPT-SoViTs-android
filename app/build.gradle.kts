@@ -5,6 +5,7 @@ plugins {
 }
 
 val acceptanceAbi = providers.gradleProperty("acceptanceAbi").orNull
+val qnnRuntimeVersion = "2.48.0"
 
 android {
     namespace = "ai.gsv.mobile"
@@ -14,16 +15,31 @@ android {
         applicationId = "ai.gsv.mobile"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "0.1.4"
+        versionCode = 6
+        versionName = "3.0.0"
         if (acceptanceAbi != null) {
             ndk { abiFilters += acceptanceAbi }
         }
     }
 
     buildFeatures { compose = true; buildConfig = true }
+    bundle { language { enableSplit = false } }
     packaging {
-        jniLibs { useLegacyPackaging = true }
+        jniLibs {
+            useLegacyPackaging = true
+            excludes += setOf(
+                "**/libQnnGpu.so",
+                "**/libQnnDsp.so",
+                "**/libQnnDspV66Skel.so",
+                "**/libQnnDspV66Stub.so",
+                "**/libQnnHtpV68Skel.so",
+                "**/libQnnHtpV68Stub.so",
+                "**/libQnnHtpV69Skel.so",
+                "**/libQnnHtpV69Stub.so",
+                "**/libQnnHtpV73Skel.so",
+                "**/libQnnHtpV73Stub.so",
+            )
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -46,6 +62,10 @@ dependencies {
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     implementation("org.pytorch:pytorch_android:2.1.0")
     // QNN is the first-class ONNX Runtime build for the NPU path.  It brings the
-    // QNN execution provider; qnn-runtime is pulled transitively by this artifact.
+    // QNN execution provider. Pin the native runtime to the QAIRT SDK generation used by
+    // tools/build_qnn_htp_context.py instead of accepting ORT's older transitive default.
     implementation("com.microsoft.onnxruntime:onnxruntime-android-qnn:1.28.0")
+    implementation("com.qualcomm.qti:qnn-runtime:$qnnRuntimeVersion")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

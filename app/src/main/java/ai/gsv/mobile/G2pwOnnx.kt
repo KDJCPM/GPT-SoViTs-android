@@ -1,5 +1,6 @@
 package ai.gsv.mobile
 
+import ai.onnxruntime.OnnxJavaType
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtLoggingLevel
@@ -11,7 +12,9 @@ import java.util.HashMap
 import java.io.Closeable
 import java.io.File
 import java.nio.FloatBuffer
+import java.nio.IntBuffer
 import java.nio.LongBuffer
+import java.nio.ShortBuffer
 
 data class G2pwInputs(
     val rows: Int,
@@ -68,14 +71,15 @@ class G2pwOnnx(
 ) : Closeable {
     init {
         require((staticRows == null) == (staticSequenceLength == null)) {
-            "G2PW static shape 必须同时声明 rows 和 sequence length"
+            "G2PW static shape must declare both rows and sequence length"
         }
         require(staticRows == null || staticRows == 1) {
-            "当前静态 G2PW executor 只支持 rows=1 的转换产物"
+            "the static G2PW executor only supports conversion artifacts with rows=1"
         }
     }
     private val environment = OrtEnvironment.getEnvironment()
     private val qnnEnabled = qnnTarget != null
+    private val profilingEnabled = qnnEnabled && BuildConfig.DEBUG
     private var profileEnded = false
     var executionStats: QnnExecutionStats? = null
         private set
@@ -86,7 +90,7 @@ class G2pwOnnx(
             if (qnnTarget != null) {
                 setSessionLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING)
                 addConfigEntry("session.disable_cpu_ep_fallback", if (strictQnn) "1" else "0")
-                enableProfiling(File(model.parentFile, "qnn-profile").path)
+                if (profilingEnabled) enableProfiling(File(model.parentFile, "qnn-profile").path)
                 val options = HashMap<String, String>().apply {
                     put("backend_type", "htp")
                     // Keep the quality reference explicit. Qualcomm HTP uses FP16 math for FP
@@ -103,7 +107,7 @@ class G2pwOnnx(
         val staticLength = staticSequenceLength
         if (staticLength != null) {
             require(input.sequenceLength <= staticLength) {
-                "G2PW 输入长度 ${input.sequenceLength} 超过静态上限 $staticLength"
+                "G2PW input length ${input.sequenceLength} exceeds the static limit $staticLength"
             }
             val values = Array(input.rows) { row ->
                 val padded = padForStatic(input, row, staticLength)
@@ -113,18 +117,73 @@ class G2pwOnnx(
                 )[0]
             }
             logProbabilityMargins(values)
-            if (qnnEnabled) finishProfiling()
+            if (profilingEnabled) finishProfiling()
             return values
         }
         val values = maskIfRawLogits(TimingContext.measure("g2pw.inference") { execute(input) }, input)
         logProbabilityMargins(values)
-        if (qnnEnabled) finishProfiling()
+        if (profilingEnabled) finishProfiling()
         return values
     }
 
     private fun execute(input: G2pwInputs): Array<FloatArray> {
         val sequenceShape = longArrayOf(input.rows.toLong(), input.sequenceLength.toLong())
         val maskShape = longArrayOf(input.rows.toLong(), input.labelCount.toLong())
+        if (htpFp16Precision) {
+            fun intTensor(values: LongArray, shape: LongArray): OnnxTensor {
+                val converted = IntArray(values.size) { index ->
+                    val value = values[index]
+                    require(value in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong()) {
+                        "G2PW context input exceeds INT32: $value"
+                    }
+                    value.toInt()
+                }
+                return OnnxTensor.createTensor(environment, IntBuffer.wrap(converted), shape)
+            }
+            intTensor(input.inputIds, sequenceShape).use { ids ->
+                intTensor(input.tokenTypeIds, sequenceShape).use { types ->
+                    intTensor(input.attentionMask, sequenceShape).use { attention ->
+                        val mask = ShortArray(input.phonemeMask.size) { index ->
+                            floatToHalf(input.phonemeMask[index])
+                        }
+                        OnnxTensor.createTensor(
+                            environment,
+                            ShortBuffer.wrap(mask),
+                            maskShape,
+                            OnnxJavaType.FLOAT16,
+                        ).use { phonemes ->
+                            intTensor(input.charIds, longArrayOf(input.rows.toLong())).use { chars ->
+                                intTensor(input.positionIds, longArrayOf(input.rows.toLong())).use { positions ->
+                                    return TimingContext.measure("g2pw.ort_session_run") {
+                                        session.run(
+                                            mapOf(
+                                                "input_ids" to ids,
+                                                "token_type_ids" to types,
+                                                "attention_mask" to attention,
+                                                "phoneme_mask" to phonemes,
+                                                "char_ids" to chars,
+                                                "position_ids" to positions,
+                                            )
+                                        ).use { result ->
+                                            val buffer = (result[0] as OnnxTensor).shortBuffer
+                                            val values = ShortArray(buffer.remaining()).also(buffer::get)
+                                            require(values.size == input.rows * input.labelCount) {
+                                                "G2PW context returned ${values.size} values, expected ${input.rows * input.labelCount}"
+                                            }
+                                            Array(input.rows) { row ->
+                                                FloatArray(input.labelCount) { column ->
+                                                    halfToFloat(values[row * input.labelCount + column])
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         OnnxTensor.createTensor(environment, LongBuffer.wrap(input.inputIds), sequenceShape).use { ids ->
             OnnxTensor.createTensor(environment, LongBuffer.wrap(input.tokenTypeIds), sequenceShape).use { types ->
                 OnnxTensor.createTensor(environment, LongBuffer.wrap(input.attentionMask), sequenceShape).use { attention ->
@@ -200,13 +259,13 @@ class G2pwOnnx(
     }
 
     override fun close() {
-        if (qnnEnabled) finishProfiling()
+        if (profilingEnabled) finishProfiling()
         session.close()
     }
 
     /** Close the audit profile even when a sentence contains no queried polyphonic characters. */
     fun finalizeProfiling() {
-        if (qnnEnabled) finishProfiling()
+        if (profilingEnabled) finishProfiling()
     }
 
     private fun finishProfiling() {
@@ -307,5 +366,48 @@ class G2pwOnnx(
             }
         }
         return false
+    }
+
+    private fun floatToHalf(value: Float): Short {
+        val bits = value.toRawBits()
+        val sign = (bits ushr 16) and 0x8000
+        var exponent = ((bits ushr 23) and 0xff) - 127 + 15
+        var mantissa = bits and 0x7fffff
+        val half = when {
+            exponent <= 0 -> {
+                if (exponent < -10) sign
+                else {
+                    mantissa = (mantissa or 0x800000) ushr (1 - exponent)
+                    sign or ((mantissa + 0x1000) ushr 13)
+                }
+            }
+            exponent >= 31 -> sign or 0x7c00
+            else -> sign or (exponent shl 10) or ((mantissa + 0x1000) ushr 13)
+        }
+        return half.toShort()
+    }
+
+    private fun halfToFloat(value: Short): Float {
+        val half = value.toInt() and 0xffff
+        val sign = (half and 0x8000) shl 16
+        var exponent = (half ushr 10) and 0x1f
+        var mantissa = half and 0x3ff
+        val bits = when {
+            exponent == 0 -> {
+                if (mantissa == 0) sign
+                else {
+                    exponent = 1
+                    while (mantissa and 0x400 == 0) {
+                        mantissa = mantissa shl 1
+                        exponent--
+                    }
+                    mantissa = mantissa and 0x3ff
+                    sign or ((exponent + 112) shl 23) or (mantissa shl 13)
+                }
+            }
+            exponent == 31 -> sign or 0x7f800000 or (mantissa shl 13)
+            else -> sign or ((exponent + 112) shl 23) or (mantissa shl 13)
+        }
+        return Float.fromBits(bits)
     }
 }

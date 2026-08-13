@@ -29,5 +29,14 @@ class ModelProfilesTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 detect_sovits(path)
 
+    def test_android_builder_uses_full_bilingual_staged_artifacts(self):
+        builder = (
+            Path(__file__).parents[1] / "tools/build_android_cpu_pipeline.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("build/g2pw-mobile-v3", builder)
+        self.assertIn("full-zh-en-g2pw-v3", builder)
+        self.assertIn("'--bert-stage',bert.name,'--acoustic-stage','pipeline_core.pt'", builder)
+        self.assertNotIn("here/'build_pipeline.py'", builder)
+
 if __name__ == "__main__":
     unittest.main()

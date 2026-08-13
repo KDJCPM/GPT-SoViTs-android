@@ -6,21 +6,33 @@ import android.os.Build
 enum class QualcommTargetSoc(
     val id: String,
     val displayName: String,
+    val asic: String,
+    val socModel: Int,
+    val htpArch: String,
     private val platformPrefixes: Set<String>,
 ) {
     SNAPDRAGON_8_GEN_3(
         "snapdragon_8_gen_3",
         "Snapdragon 8 Gen 3",
+        "SM8650",
+        57,
+        "V75",
         setOf("SM8650"),
     ),
     SNAPDRAGON_8_ELITE(
         "snapdragon_8_elite",
         "Snapdragon 8 Elite",
+        "SM8750",
+        69,
+        "V79",
         setOf("SM8750"),
     ),
     SNAPDRAGON_8_ELITE_GEN_5(
         "snapdragon_8_elite_gen_5",
         "Snapdragon 8 Elite Gen 5",
+        "SM8850",
+        87,
+        "V81",
         setOf("SM8850"),
     );
 
@@ -42,7 +54,6 @@ enum class QualcommTargetSoc(
             val values = buildList {
                 if (Build.VERSION.SDK_INT >= 31) add(Build.SOC_MODEL)
                 add(Build.HARDWARE)
-                add(Build.BOARD)
             }
             return fromPlatformStrings(values)
         }
@@ -60,42 +71,81 @@ data class QualcommTargetStatus(
 
 object QualcommTargetPolicy {
     const val FAMILY = "qualcomm_snapdragon_8"
+    const val RUNTIME_VERSION = "2.48.0"
+
+    fun requireArtifactIdentity(model: ModelPackage): QualcommTargetSoc {
+        require(model.executor == "qnn-htp") { "QNN package executor must be qnn-htp" }
+        val target = QualcommTargetSoc.entries.firstOrNull { it.id == model.targetSoc }
+        require(target != null) { "QNN package target_soc is outside the product allowlist" }
+        require(model.targetSocFamily == FAMILY) { "QNN package target_soc_family is unsupported" }
+        require(model.targetAsic == target.asic) {
+            "QNN package target_asic ${model.targetAsic} does not match ${target.asic}"
+        }
+        require(model.targetSocModel == target.socModel) {
+            "QNN package target_soc_model ${model.targetSocModel} does not match ${target.socModel}"
+        }
+        require(model.htpArch == target.htpArch) {
+            "QNN package htp_arch ${model.htpArch} does not match ${target.htpArch}"
+        }
+        require(model.supportedTargetSocs == setOf(target.id)) {
+            "QNN package supported_target_socs must contain only ${target.id}"
+        }
+        val qairtParts = model.qairtVersion.split('.')
+        require(
+            qairtParts.size == 4 && qairtParts.all { part -> part.toIntOrNull() != null } &&
+                qairtParts.take(3).joinToString(".") == RUNTIME_VERSION
+        ) {
+            "QNN package QAIRT ${model.qairtVersion} does not match Android QNN $RUNTIME_VERSION"
+        }
+        require(model.qnnRuntimeVersion == RUNTIME_VERSION) {
+            "QNN package runtime ${model.qnnRuntimeVersion} does not match Android QNN $RUNTIME_VERSION"
+        }
+        require(model.backendArtifact.isNotBlank()) { "QNN package is missing backend_artifact" }
+        return target
+    }
 
     fun current(): QualcommTargetStatus {
         val observed = buildList {
             if (Build.VERSION.SDK_INT >= 31) add(Build.SOC_MODEL)
             add(Build.HARDWARE)
-            add(Build.BOARD)
         }.filter { it.isNotBlank() && !it.equals("unknown", ignoreCase = true) }
         return QualcommTargetStatus(QualcommTargetSoc.fromPlatformStrings(observed), observed)
     }
 
     fun isCompatible(model: ModelPackage, status: QualcommTargetStatus = current()): Boolean {
-        if (model.executor != "qnn-htp" || !status.isProductTarget) return false
-        val target = requireNotNull(status.target)
-        val declared = model.targetSoc.trim().lowercase()
-        if (declared != target.id) return false
-        if (model.targetSocFamily != FAMILY) return false
-        if (model.supportedTargetSocs.isNotEmpty() && target.id !in model.supportedTargetSocs) return false
-        return model.htpArch.isNotBlank() && model.qairtVersion.isNotBlank() && model.backendArtifact.isNotBlank()
+        if (!status.isProductTarget) return false
+        val artifactTarget = runCatching { requireArtifactIdentity(model) }.getOrNull() ?: return false
+        return artifactTarget == status.target
     }
 
     fun explain(model: ModelPackage, status: QualcommTargetStatus = current()): String {
-        if (model.executor != "qnn-htp") return "不是 QNN HTP 模型包"
+        if (model.executor != "qnn-htp") return "not a QNN HTP model package"
         if (!status.isProductTarget) {
-            return "当前设备不在 QNN 产品目标内（仅支持 Snapdragon 8 Gen 3、8 Elite、8 Elite Gen 5）"
+            return "device is outside the QNN product targets (Snapdragon 8 Gen 3, 8 Elite, and 8 Elite Gen 5)"
         }
         val target = requireNotNull(status.target)
         if (model.targetSoc != target.id) {
-            return "QNN 包目标为 ${model.targetSoc}，当前设备为 ${target.displayName}"
+            return "QNN package targets ${model.targetSoc}, but this device is ${target.displayName}"
         }
-        if (model.targetSocFamily != FAMILY) return "QNN 包 target_soc_family 不匹配"
+        if (model.targetSocFamily != FAMILY) return "QNN package target_soc_family does not match"
+        if (!model.targetAsic.equals(target.asic, ignoreCase = true)) {
+            return "QNN package ASIC is ${model.targetAsic}, but ${target.displayName} requires ${target.asic}"
+        }
+        if (model.targetSocModel != target.socModel) {
+            return "QNN package socModel=${model.targetSocModel}, but ${target.displayName} requires ${target.socModel}"
+        }
         if (model.supportedTargetSocs.isNotEmpty() && target.id !in model.supportedTargetSocs) {
-            return "QNN 包未声明当前 SoC"
+            return "QNN package does not declare this SoC"
         }
-        if (model.htpArch.isBlank() || model.qairtVersion.isBlank() || model.backendArtifact.isBlank()) {
-            return "QNN 包缺少完整的 HTP/QAIRT/backend artifact 兼容信息"
+        if (!model.htpArch.equals(target.htpArch, ignoreCase = true)) {
+            return "QNN package HTP architecture is ${model.htpArch}, but ${target.displayName} requires ${target.htpArch}"
         }
-        return "当前版本未链接 QNN JNI/HTP 运行库"
+        if (model.qairtVersion.isBlank() || model.backendArtifact.isBlank()) {
+            return "QNN package is missing complete HTP, QAIRT, or backend artifact compatibility metadata"
+        }
+        if (runCatching { requireArtifactIdentity(model) }.isFailure) {
+            return "QNN package backend identity is internally inconsistent"
+        }
+        return "this build does not link the QNN JNI/HTP runtime"
     }
 }

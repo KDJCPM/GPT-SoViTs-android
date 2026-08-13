@@ -22,9 +22,11 @@ p.add_argument('--pipeline',default='pipeline.pt',help='Pipeline filename inside
 p.add_argument('--bert-stage',help='Optional staged FP32 BERT filename inside --artifacts')
 p.add_argument('--acoustic-stage',help='Optional staged acoustic filename inside --artifacts')
 p.add_argument('--frontend-profile',default='portable-char-v1')
-p.add_argument('--upstream-equivalent',action='store_true')
+p.add_argument('--upstream-equivalent',action='store_true',help='Mark deployable only after the converted CPU artifact has passed upstream correctness validation')
+p.add_argument('--validation-report',type=Path,help='Hash-bound report emitted by validate_v2pp_cpu_artifacts.py; required with --upstream-equivalent')
 p.add_argument('--minimum-ram-mb',type=int,default=6144)
 p.add_argument('--runtime-options',action='store_true',help='Advertise option-aware graph ABI v1; only use with an exporter that consumes all options')
+p.add_argument('--reference-input',action='store_true',help='Advertise request-scoped reference PCM/text ABI v1')
 a=p.parse_args()
 split_outputs = a.pipeline_output is not None or a.model_output is not None
 if a.pipeline_output is not None and a.model_output is None:
@@ -33,6 +35,10 @@ if a.output is not None and split_outputs:
     raise SystemExit('--output cannot be combined with standalone outputs')
 if not split_outputs and a.output is None:
     raise SystemExit('--output is required unless standalone outputs are supplied')
+if a.upstream_equivalent and a.frontend is None:
+    raise SystemExit('--upstream-equivalent requires the complete converted frontend bundle')
+if a.upstream_equivalent != (a.validation_report is not None):
+    raise SystemExit('--upstream-equivalent and --validation-report must be supplied together')
 staged=bool(a.bert_stage or a.acoustic_stage)
 if staged and not (a.bert_stage and a.acoustic_stage): raise SystemExit('--bert-stage and --acoustic-stage must be supplied together')
 required=[a.bert_stage,a.acoustic_stage] if staged else [a.pipeline]
@@ -47,26 +53,76 @@ if a.frontend:
     for src in sorted(a.frontend.rglob('*')):
         if src.is_file(): files.append({'path':f'runtime/frontend/{src.relative_to(a.frontend)}','source':src,'size':src.stat().st_size,'sha256':digest(src)})
 profile=PROFILES[a.version]
+
+validation=None
+if a.validation_report is not None:
+    report_path=a.validation_report.resolve()
+    report=json.loads(report_path.read_text(encoding='utf-8'))
+    if report.get('format')!='gsv-v2pp-cpu-upstream-validation' or report.get('format_version')!=1:
+        raise SystemExit('CPU validation report has an unsupported format')
+    if report.get('passed') is not True:
+        raise SystemExit('CPU validation report did not pass')
+    if report.get('model_version')!=profile.id:
+        raise SystemExit('CPU validation report targets another model version')
+    if report.get('frontend_profile')!=a.frontend_profile:
+        raise SystemExit('CPU validation report targets another frontend profile')
+    reported={item['path']:(int(item['size']),item['sha256']) for item in report.get('files',[])}
+    actual={item['path']:(int(item['size']),item['sha256']) for item in files}
+    if reported!=actual:
+        missing=sorted(set(actual)-set(reported)); extra=sorted(set(reported)-set(actual))
+        changed=sorted(path for path in set(actual)&set(reported) if actual[path]!=reported[path])
+        raise SystemExit(
+            'CPU validation report does not bind the exact deployment files: '
+            f'missing={missing} extra={extra} changed={changed}'
+        )
+    sources=report.get('sources')
+    if not isinstance(sources,dict) or set(sources)!={'gpt','sovits'}:
+        raise SystemExit('CPU validation report is missing source checkpoint identities')
+    for name,item in sources.items():
+        checksum=str(item.get('sha256','')) if isinstance(item,dict) else ''
+        if len(checksum)!=64 or any(character not in '0123456789abcdef' for character in checksum):
+            raise SystemExit(f'CPU validation report has an invalid {name} checkpoint identity')
+    validation={
+        'format':report['format'],
+        'format_version':report['format_version'],
+        'report_sha256':digest(report_path),
+        'sources':{name:{'sha256':item['sha256']} for name,item in sources.items()},
+    }
 def option_manifest(manifest: dict) -> None:
     if a.runtime_options:
         manifest['runtime_options_version']=1
-        manifest['runtime_options']={
+        options={
             'temperature':{'type':'float','min':0.0,'max':2.0,'default':1.0,'stage':'semantic_sampling'},
             'top_p':{'type':'float','min':0.0,'max':1.0,'default':1.0,'stage':'semantic_sampling'},
             'top_k':{'type':'int','min':1,'max':100,'default':10,'stage':'semantic_sampling'},
             'repetition_penalty':{'type':'float','min':0.0,'max':3.0,'default':1.35,'stage':'semantic_sampling'},
             'speed_factor':{'type':'float','min':0.25,'max':4.0,'default':1.0,'stage':'acoustic_decode'},
-            'sample_steps':{'type':'int','min':1,'max':128,'default':32,'stage':'cfm'},
+            'seed':{'type':'int','min':-1,'max':9223372036854775807,'default':-1,'stage':'semantic_sampling'},
+        }
+        if profile.id == 'v4':
+            options['sample_steps']={'type':'int','min':1,'max':128,'default':32,'stage':'cfm'}
+        manifest['runtime_options']=options
+    if a.reference_input:
+        manifest['reference_input_version']=1
+        manifest['reference_input']={
+            'preset_when_omitted':True,
+            'pcm':[
+                {'sample_rate':16000,'channels':1,'dtype':'float32'},
+                {'sample_rate':32000,'channels':1,'dtype':'float32'},
+            ],
+            'prompt':'utf8_text',
+            'conditioning_stage':'converted_artifact',
         }
 
 def write_package(output: Path, artifact_role: str|None, package_files: list[dict]) -> None:
     backend_artifact = 'torchscript-cpu-staged' if staged else 'torchscript-cpu-single'
     manifest={'format':'gsvm-deploy','format_version':1,'name':a.name,'model_version':profile.id,'sample_rate':profile.sample_rate,
       'executor':'torchscript-cpu-staged' if staged else 'torchscript-cpu-single','entrypoint':'synthesize_utf8_to_pcm16','api_version':1,
-      'deployable':True,'frontend_profile':a.frontend_profile,'upstream_equivalent':a.upstream_equivalent,
+      'deployable':a.upstream_equivalent,'frontend_profile':a.frontend_profile,'upstream_equivalent':a.upstream_equivalent,
       'minimum_ram_mb':a.minimum_ram_mb,
       'target_soc':'any','target_soc_family':'cpu','backend_artifact':backend_artifact,
       'files':[{k:v for k,v in x.items() if k!='source'} for x in package_files]}
+    if validation is not None: manifest['upstream_validation']=validation
     if artifact_role:
         manifest['artifact_role']=artifact_role
         # Compatibility belongs to the prepared runtime ABI, not to a voice/model name. This lets

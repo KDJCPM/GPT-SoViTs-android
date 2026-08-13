@@ -25,6 +25,7 @@ def main() -> None:
     p.add_argument('--language',default='all_zh'); p.add_argument('--minimum-ram-mb',type=int,default=6144)
     p.add_argument('--runtime-options',action='store_true',help='Mark option-aware graph ABI v1')
     p.add_argument('--reuse-export',action='store_true',help='Reuse t2s.pt/vits.pt/conditioning.safetensors in --work')
+    p.add_argument('--validation-report',type=Path,help='Passed hash-bound report from validate_v2pp_cpu_artifacts.py')
     a=p.parse_args()
     if a.pipeline_output is not None and a.model_output is None:
         raise SystemExit('--pipeline-output requires --model-output')
@@ -42,17 +43,29 @@ def main() -> None:
         if a.vocoder: export_args.extend(['--vocoder',a.vocoder.resolve()])
         run(*export_args)
     if profile.id != 'v4':
-        run(sys.executable,here/'fuse_pipeline.py','--artifacts',work,'--output',work/'pipeline_core.pt')
+        ssl=work/'ssl_mobile_fp32.pt'
+        if not (a.reuse_export and ssl.is_file()):
+            ssl_model=(upstream/'pretrained_models/chinese-hubert-base') if (upstream/'pretrained_models/chinese-hubert-base').exists() else (upstream/'GPT_SoVITS/pretrained_models/chinese-hubert-base')
+            run(sys.executable,here/'export_ssl_mobile.py','--model',ssl_model,'--output',ssl)
+        run(sys.executable,here/'fuse_pipeline.py','--artifacts',work,'--ssl',ssl,'--output',work/'pipeline_core.pt')
     bert=work/'bert_mobile_fp32_eager.pt'
-    run(sys.executable,here/'export_bert_mobile.py','--model',upstream/'GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large','--output',bert)
+    if not (a.reuse_export and bert.is_file()):
+        bert_model=(upstream/'pretrained_models/chinese-roberta-wwm-ext-large') if (upstream/'pretrained_models/chinese-roberta-wwm-ext-large').exists() else (upstream/'GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large')
+        run(sys.executable,here/'export_bert_mobile.py','--model',bert_model,'--output',bert)
     phrase_cache=here.parent/'build/frontend-phrases-v2.json'
     if not phrase_cache.is_file():
         run(sys.executable,here/'compile_frontend_phrases.py','--upstream',upstream,'--output',phrase_cache)
-    frontend=here.parent/'build/g2pw-mobile'
-    if not (frontend/'g2pW.onnx').is_file():
+    frontend=here.parent/'build/g2pw-mobile-v3'
+    frontend_files=(
+        'frontend.json','g2pW.onnx','jieba-dict.txt','jieba-pos-hmm.bin',
+        'polyphonic.rep','polyphonic-fix.rep','english.json','english-lexicon.tsv',
+        'english-homographs.tsv','english-names.tsv','english-tagger.bin','english-g2p.bin',
+        'english-unigrams.tsv','english-bigrams.tsv',
+    )
+    if any(not (frontend/name).is_file() for name in frontend_files):
         run(sys.executable,here/'export_g2pw_mobile.py','--upstream',upstream,'--output',frontend)
     package=[sys.executable,here/'build_cpu_package.py','--artifacts',work,
-        '--frontend',frontend,'--name',a.name,'--version',profile.id,'--frontend-profile','full-g2pw-v2','--minimum-ram-mb',a.minimum_ram_mb]
+        '--frontend',frontend,'--name',a.name,'--version',profile.id,'--frontend-profile','full-zh-en-g2pw-v3','--minimum-ram-mb',a.minimum_ram_mb]
     if a.output is not None: package.extend(['--output',a.output.resolve()])
     if a.model_output is not None: package.extend(['--model-output',a.model_output.resolve()])
     if a.pipeline_output is not None: package.extend(['--pipeline-output',a.pipeline_output.resolve()])
@@ -60,13 +73,14 @@ def main() -> None:
     # the package command so lower-level packaging remains conservative, while the one-command
     # builder always produces a package that can consume the UI controls.
     package.append('--runtime-options')
+    package.append('--reference-input')
+    if a.validation_report is not None:
+        package.extend(['--upstream-equivalent','--validation-report',a.validation_report.resolve()])
     if profile.id == 'v4':
         run(sys.executable,here/'build_bert_stage.py','--bert',bert,'--output',work/'bert_stage.pt')
         package.extend(['--bert-stage','bert_stage.pt','--acoustic-stage','pipeline_core.pt'])
     else:
-        run(sys.executable,here/'build_pipeline.py','--artifacts',work,'--upstream',upstream,'--bert',bert,
-            '--acoustic',work/'pipeline_core.pt','--phrases-cache',phrase_cache,'--output',work/'pipeline.pt')
-        package.extend(['--pipeline','pipeline.pt'])
+        package.extend(['--bert-stage',bert.name,'--acoustic-stage','pipeline_core.pt'])
     run(*package)
     print('Created Android CPU package outputs')
 

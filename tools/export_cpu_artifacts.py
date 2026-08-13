@@ -20,15 +20,21 @@ def main() -> None:
     p.add_argument('--vocoder',type=Path,help='V4 HiFi-GAN checkpoint (defaults to the upstream pretrained vocoder)')
     p.add_argument('--language',default='all_zh'); p.add_argument('--output',required=True,type=Path)
     p.add_argument('--upstream',type=Path,default=Path('..')); a=p.parse_args()
-    upstream=a.upstream.resolve(); python=upstream/'gpt/bin/python'; output=a.output.resolve(); output.mkdir(parents=True,exist_ok=True)
+    upstream=a.upstream.resolve(); python=upstream/'gpt/bin/python'
+    # Development checkouts often do not carry the upstream project's private virtualenv.
+    # Reuse the interpreter running this dispatcher when that launcher is absent; this keeps
+    # conversion reproducible in CI and in the Android workspace without changing the artifact.
+    if not python.is_file():
+        python=Path(sys.executable)
+    output=a.output.resolve(); output.mkdir(parents=True,exist_ok=True)
     profile,lora,_=detect_sovits(a.sovits.resolve())
     if profile.id not in {'v2ProPlus','v4'}:
         raise SystemExit(f'Android scope supports only v2ProPlus and v4, got {profile.id}')
-    env=dict(os.environ, is_half='False', version=profile.id)
+    env=dict(os.environ, is_half='False', version=profile.id, NUMBA_DISABLE_CACHING='1', NUMBA_DISABLE_JIT='1')
     common=[str(python)]
     if profile.cpu_exporter == 'torchscript_stream_pro':
         command=common+[str(Path(__file__).resolve().parent/'run_v2pp_export_compat.py'),
-          "--upstream-script",str(upstream/'GPT_SoVITS/stream_v2pro.py'),"--gpt_model",str(a.gpt.resolve()),"--sovits_model",str(a.sovits.resolve()),
+          "--upstream-script",str((upstream/'stream_v2pro.py') if (upstream/'stream_v2pro.py').is_file() else (upstream/'GPT_SoVITS/stream_v2pro.py')),"--gpt_model",str(a.gpt.resolve()),"--sovits_model",str(a.sovits.resolve()),
           "--ref_audio",str(a.reference.resolve()),"--ref_text",a.prompt,"--output_path",str(output),"--device","cpu",
           "--version",profile.id,"--no-half","--lang",a.language]
     elif profile.cpu_exporter == 'torchscript_legacy':
@@ -43,7 +49,12 @@ def main() -> None:
           '--output',str(output),'--upstream',str(upstream),'--sample-steps','32']
     else:
         raise SystemExit(f'No CPU exporter for {profile.id}')
-    run(command,upstream,env)
+    # Keep the upstream tree read-only: its web UI exporter writes a transient weight.json
+    # relative to the working directory.  Execute from the writable intermediate directory
+    # while exposing the upstream checkout on PYTHONPATH for imports.
+    env['PYTHONPATH']=str(upstream)+os.pathsep+env.get('PYTHONPATH','')
+    env['GSV_EXPORT_CWD']=str(output)
+    run(command,output,env)
     print(f"Exported {profile.id}; lora={lora}; intermediate={output}")
 
 if __name__=='__main__': main()

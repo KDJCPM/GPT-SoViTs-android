@@ -4,6 +4,8 @@ import fi.iki.elonen.NanoHTTPD
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileInputStream
+import java.util.Base64
 import java.util.UUID
 
 /** Loopback-only OpenAI-compatible speech endpoint backed by the currently loaded artifact. */
@@ -12,7 +14,11 @@ class LocalOpenAiServer(
     private val outputDir: File,
     private val isReady: () -> Boolean,
     private val backendName: () -> String,
+    private val referenceExactPcm16kSamples: () -> Int?,
     private val synthesize: (SynthesisRequest, File) -> File,
+    private val requestLock: Any = Any(),
+    private val decodeReferenceFile: (File, String, String, Int?) -> ReferenceInput =
+        ReferenceAudioDecoder::decode,
 ) : NanoHTTPD(LOOPBACK, port) {
     val endpoint: String = "http://$LOOPBACK:$port/v1"
 
@@ -32,8 +38,8 @@ class LocalOpenAiServer(
         errorResponse(Response.Status.INTERNAL_ERROR, error.message ?: error::class.java.simpleName, "server_error")
     }
 
-    private fun speechResponse(session: IHTTPSession): Response {
-        if (!isReady()) throw ModelUnavailableException("尚未加载模型")
+    private fun speechResponse(session: IHTTPSession): Response = synchronized(requestLock) {
+        if (!isReady()) throw ModelUnavailableException("model is not loaded")
         val bodyFiles = HashMap<String, String>()
         session.parseBody(bodyFiles)
         val body = bodyFiles["postData"] ?: throw IllegalArgumentException("request body is required")
@@ -56,15 +62,24 @@ class LocalOpenAiServer(
                 speedFactor = json.number("speed", 1.0).toFloat(),
                 sampleSteps = json.integer("sample_steps", 32),
             ),
+            reference = decodeReference(json),
         )
         outputDir.mkdirs()
         val output = File(outputDir, "openai-${UUID.randomUUID()}.wav")
         return try {
             val result = synthesize(request, output)
-            val bytes = result.readBytes()
-            result.delete()
-            File("${result.path}.timing.json").delete()
-            cors(newFixedLengthResponse(Response.Status.OK, "audio/wav", bytes.inputStream(), bytes.size.toLong())).apply {
+            val timing = File("${result.path}.timing.json")
+            val stream = object : FileInputStream(result) {
+                override fun close() {
+                    try {
+                        super.close()
+                    } finally {
+                        result.delete()
+                        timing.delete()
+                    }
+                }
+            }
+            cors(newChunkedResponse(Response.Status.OK, "audio/wav", stream)).apply {
                 addHeader("Content-Disposition", "inline; filename=tts.wav")
                 addHeader("X-GSV-Backend", backendName())
             }
@@ -72,6 +87,33 @@ class LocalOpenAiServer(
             output.delete()
             File("${output.path}.timing.json").delete()
             throw error
+        }
+    }
+
+    private fun decodeReference(json: JSONObject): ReferenceInput? {
+        val encoded = json.optString("reference_audio", "").trim()
+        if (encoded.isEmpty()) return null
+        val prompt = json.optString("reference_text", "").trim()
+        require(prompt.isNotEmpty()) { "reference_text is required when reference_audio is supplied" }
+        require(encoded.count { !it.isWhitespace() } <= MAX_REFERENCE_BASE64_CHARS) {
+            "reference_audio exceeds the 50 MiB limit"
+        }
+        val compact = encoded.filterNot(Char::isWhitespace)
+        val bytes = runCatching { Base64.getDecoder().decode(compact) }
+            .getOrElse { throw IllegalArgumentException("reference_audio must be base64-encoded audio") }
+        require(bytes.size <= MAX_REFERENCE_BYTES) { "reference_audio exceeds the 50 MiB limit" }
+        outputDir.mkdirs()
+        val source = File(outputDir, "reference-${UUID.randomUUID()}.audio")
+        return try {
+            source.writeBytes(bytes)
+            decodeReferenceFile(
+                source,
+                prompt,
+                json.optString("reference_language", "auto"),
+                referenceExactPcm16kSamples(),
+            )
+        } finally {
+            source.delete()
         }
     }
 
@@ -123,5 +165,7 @@ class LocalOpenAiServer(
 
     companion object {
         private const val LOOPBACK = "127.0.0.1"
+        private const val MAX_REFERENCE_BYTES = 50 * 1024 * 1024
+        private const val MAX_REFERENCE_BASE64_CHARS = ((MAX_REFERENCE_BYTES + 2) / 3) * 4
     }
 }

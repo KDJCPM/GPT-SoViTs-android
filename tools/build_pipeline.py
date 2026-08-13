@@ -117,6 +117,44 @@ class Utf8TtsPipeline(torch.nn.Module):
         if seed>=0:torch.manual_seed(seed)
         return self.acoustic(phone_ids.to(torch.int64).reshape(1,-1),features,temperature,top_k,top_p,repetition_penalty,speed_factor,seed)
 
+    @torch.jit.export
+    def synthesize_reference_preprocessed_options(
+        self,
+        phone_ids: torch.Tensor,
+        token_ids: torch.Tensor,
+        word2ph: torch.Tensor,
+        chinese_mask: torch.Tensor,
+        prompt_phone_ids: torch.Tensor,
+        prompt_token_ids: torch.Tensor,
+        prompt_word2ph: torch.Tensor,
+        prompt_chinese_mask: torch.Tensor,
+        reference_pcm_16k: torch.Tensor,
+        reference_pcm_32k: torch.Tensor,
+        seed: int=-1,
+        temperature: float=1.0,
+        top_p: float=1.0,
+        top_k: int=10,
+        repetition_penalty: float=1.35,
+        speed_factor: float=1.0,
+        sample_steps: int=32,
+    ) -> Tuple[int,torch.Tensor]:
+        ids=token_ids.to(torch.int64).reshape(1,-1)
+        features=self.bert(ids,torch.ones_like(ids),torch.zeros_like(ids),word2ph.to(torch.int32).reshape(-1))
+        features=features*chinese_mask.to(features.dtype).reshape(-1,1)
+        prompt_ids=prompt_token_ids.to(torch.int64).reshape(1,-1)
+        prompt_features=self.bert(
+            prompt_ids,torch.ones_like(prompt_ids),torch.zeros_like(prompt_ids),
+            prompt_word2ph.to(torch.int32).reshape(-1),
+        )
+        prompt_features=prompt_features*prompt_chinese_mask.to(prompt_features.dtype).reshape(-1,1)
+        if seed>=0:torch.manual_seed(seed)
+        return self.acoustic.synthesize_reference_options(
+            phone_ids.to(torch.int64).reshape(1,-1),features,
+            reference_pcm_16k.float().reshape(1,-1),reference_pcm_32k.float().reshape(1,-1),
+            prompt_phone_ids.to(torch.int64).reshape(1,-1),prompt_features,
+            temperature,top_k,top_p,repetition_penalty,speed_factor,sample_steps,seed,
+        )
+
 
 def make_tables(upstream: Path, cache: Path) -> tuple[dict[int,list[int]],dict[int,int],dict[int,bool]]:
     if cache.is_file():
@@ -235,7 +273,10 @@ def main():
     acoustic_path=a.acoustic.resolve() if a.acoustic else artifacts/'pipeline_core.pt'
     bert=torch.jit.load(str(bert_path),map_location='cpu'); acoustic=torch.jit.load(str(acoustic_path),map_location='cpu')
     module=torch.jit.script(Utf8TtsPipeline(bert,acoustic,phones,tokens,chinese,phrase_trie).eval())
-    module=torch.jit.freeze(module,preserved_attrs=['synthesize_preprocessed', 'synthesize_preprocessed_options']); module.save(str(output))
+    module=torch.jit.freeze(module,preserved_attrs=[
+        'synthesize_preprocessed', 'synthesize_preprocessed_options',
+        'synthesize_reference_preprocessed_options',
+    ]); module.save(str(output))
     print(f'Created {output} ({output.stat().st_size} bytes); symbols={len(phones)}')
 
 if __name__=='__main__': main()

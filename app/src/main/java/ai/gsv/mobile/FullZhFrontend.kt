@@ -9,6 +9,7 @@ class FullZhFrontend(
     frontendDir: File,
     qnnTarget: QualcommTargetSoc? = null,
     modelFile: File = File(frontendDir, "g2pW.onnx"),
+    strictQnn: Boolean = false,
     staticRows: Int? = null,
     staticSequenceLength: Int? = null,
     htpFp16Precision: Boolean = false,
@@ -41,6 +42,7 @@ class FullZhFrontend(
     private val model = G2pwOnnx(
         modelFile,
         qnnTarget,
+        strictQnn = strictQnn,
         staticRows = staticRows,
         staticSequenceLength = staticSequenceLength,
         htpFp16Precision = htpFp16Precision,

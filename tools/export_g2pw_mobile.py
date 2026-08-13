@@ -4,6 +4,120 @@ import argparse, json, os, shutil, struct, sys
 from pathlib import Path
 
 
+def _write_string(handle, value: str) -> None:
+    encoded = value.encode("utf-8")
+    if len(encoded) > 65535:
+        raise ValueError("frontend string exceeds the binary ABI limit")
+    handle.write(struct.pack(">H", len(encoded)))
+    handle.write(encoded)
+
+
+def _write_english_assets(root: Path, output: Path, symbol_ids: dict[str, int]) -> None:
+    """Freeze the upstream English frontend data into Android-friendly files."""
+    from text import english
+    import g2p_en
+    import nltk
+    import numpy as np
+    import wordsegment
+
+    # Use the initialized upstream frontend, not get_dict(): en_G2p removes six known-bad
+    # abbreviation pronunciations during initialization. Keep the title-case name dictionary
+    # separate because upstream only consults it for an original token where str.istitle() is true.
+    lexicon = dict(english._g2p.cmu)
+    names = dict(english._g2p.namedict)
+    with (output / "english-lexicon.tsv").open("w", encoding="utf-8", newline="\n") as handle:
+        for word in sorted(lexicon):
+            pronunciations = lexicon[word]
+            if pronunciations:
+                handle.write(f"{word}\t{' '.join(pronunciations[0])}\n")
+    with (output / "english-names.tsv").open("w", encoding="utf-8", newline="\n") as handle:
+        for word in sorted(names):
+            pronunciations = names[word]
+            if pronunciations:
+                handle.write(f"{word}\t{' '.join(pronunciations[0])}\n")
+
+    homographs = dict(english._g2p.homograph2features)
+    with (output / "english-homographs.tsv").open("w", encoding="utf-8", newline="\n") as handle:
+        for word in sorted(homographs):
+            first, second, tag = homographs[word]
+            handle.write(f"{word}\t{' '.join(first)}\t{' '.join(second)}\t{tag}\n")
+
+    tagger_root = Path(str(nltk.data.find("taggers/averaged_perceptron_tagger_eng")))
+    weights = json.loads(
+        (tagger_root / "averaged_perceptron_tagger_eng.weights.json").read_text(encoding="utf-8")
+    )
+    tagdict = json.loads(
+        (tagger_root / "averaged_perceptron_tagger_eng.tagdict.json").read_text(encoding="utf-8")
+    )
+    classes = sorted(
+        json.loads(
+            (tagger_root / "averaged_perceptron_tagger_eng.classes.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    class_ids = {value: index for index, value in enumerate(classes)}
+    with (output / "english-tagger.bin").open("wb") as handle:
+        handle.write(b"EPT1")
+        handle.write(struct.pack(">H", len(classes)))
+        for value in classes:
+            _write_string(handle, value)
+        handle.write(struct.pack(">I", len(tagdict)))
+        for word, tag in sorted(tagdict.items()):
+            _write_string(handle, word)
+            handle.write(struct.pack(">H", class_ids[tag]))
+        handle.write(struct.pack(">I", len(weights)))
+        for feature, values in sorted(weights.items()):
+            _write_string(handle, feature)
+            handle.write(struct.pack(">H", len(values)))
+            for tag, weight in sorted(values.items()):
+                handle.write(struct.pack(">Hf", class_ids[tag], float(weight)))
+
+    model_root = Path(g2p_en.__file__).resolve().parent
+    variables = np.load(model_root / "checkpoint20.npz")
+    array_names = (
+        "enc_emb",
+        "enc_w_ih",
+        "enc_w_hh",
+        "enc_b_ih",
+        "enc_b_hh",
+        "dec_emb",
+        "dec_w_ih",
+        "dec_w_hh",
+        "dec_b_ih",
+        "dec_b_hh",
+        "fc_w",
+        "fc_b",
+    )
+    with (output / "english-g2p.bin").open("wb") as handle:
+        handle.write(b"EGP1")
+        handle.write(struct.pack(">H", len(array_names)))
+        for name in array_names:
+            array = np.asarray(variables[name], dtype=">f4", order="C")
+            _write_string(handle, name)
+            handle.write(struct.pack(">B", array.ndim))
+            for size in array.shape:
+                handle.write(struct.pack(">I", size))
+            handle.write(array.tobytes(order="C"))
+
+    segment_root = Path(wordsegment.__file__).resolve().parent
+    shutil.copyfile(segment_root / "unigrams.txt", output / "english-unigrams.tsv")
+    shutil.copyfile(segment_root / "bigrams.txt", output / "english-bigrams.tsv")
+
+    english_config = {
+        "format": "gsv-english-mobile",
+        "version": 1,
+        "symbol_ids": symbol_ids,
+        "punctuation": ["!", "?", "...", ",", ".", "-"],
+        "wordsegment_total": 1024908267229.0,
+        "wordsegment_limit": 24,
+    }
+    (output / "english.json").write_text(
+        json.dumps(english_config, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+
 def main() -> None:
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--upstream',type=Path,default=Path('..'));p.add_argument('--output',required=True,type=Path);a=p.parse_args()
     root=a.upstream.resolve();output=a.output.resolve();os.chdir(root);sys.path.insert(0,str(root/'GPT_SoVITS'))
@@ -74,6 +188,7 @@ def main() -> None:
         for char in all_chars:
             allowed=char_state_tab_P.get(char,states);handle.write(struct.pack('>I',ord(char)));handle.write(struct.pack('>H',len(allowed)))
             for state in allowed:handle.write(struct.pack('>Hd',state_ids[state],pos_emit[state].get(char,-3.14e100)))
+    _write_english_assets(root, output, symbol_ids)
     print(f'Created {output}; config={(output/"frontend.json").stat().st_size}; model={(output/"g2pW.onnx").stat().st_size}')
 
 if __name__=='__main__':main()

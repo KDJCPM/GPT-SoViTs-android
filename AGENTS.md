@@ -25,6 +25,13 @@ Conversion is allowed to be complex; execution must be as simple as possible.
 
 ## Android runtime contract
 
+## Device storage contract
+
+- Android model packages and QNN attachments belong under `/sdcard/models/gs` only.
+- Never place models, converted artifacts, temporary files or test outputs in the `/sdcard/` root.
+- Device-side scripts must create and use `/sdcard/models/gs` explicitly; host build outputs stay in
+  the repository `build/` tree and are not copied to arbitrary shared-storage paths.
+
 The Android layer should remain a thin host:
 
 1. import and verify one deployable package;

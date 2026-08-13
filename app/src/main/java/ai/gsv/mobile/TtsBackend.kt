@@ -6,6 +6,7 @@ import java.io.RandomAccessFile
 import android.util.Log
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtProvider
+import org.json.JSONObject
 import org.pytorch.IValue
 import org.pytorch.Module
 import org.pytorch.Tensor
@@ -19,12 +20,12 @@ data class SynthesisOptions(
     val sampleSteps: Int = 32,
 ) {
     init {
-        require(temperature >= 0.0f && temperature <= 2.0f) { "temperature 必须在 0 到 2 之间" }
-        require(topP >= 0.0f && topP <= 1.0f) { "top_p 必须在 0 到 1 之间" }
-        require(topK in 1..100) { "top_k 必须在 1 到 100 之间" }
-        require(repetitionPenalty > 0.0f && repetitionPenalty <= 3.0f) { "重复惩罚必须在 0 到 3 之间" }
-        require(speedFactor in 0.25f..4.0f) { "语速必须在 0.25 到 4 之间" }
-        require(sampleSteps in 1..128) { "采样步数必须在 1 到 128 之间" }
+        require(temperature >= 0.0f && temperature <= 2.0f) { "temperature must be between 0 and 2" }
+        require(topP >= 0.0f && topP <= 1.0f) { "top_p must be between 0 and 1" }
+        require(topK in 1..100) { "top_k must be between 1 and 100" }
+        require(repetitionPenalty > 0.0f && repetitionPenalty <= 3.0f) { "repetition penalty must be between 0 and 3" }
+        require(speedFactor in 0.25f..4.0f) { "speed must be between 0.25 and 4" }
+        require(sampleSteps in 1..128) { "sample steps must be between 1 and 128" }
     }
 
     fun isDefault() = this == SynthesisOptions()
@@ -35,6 +36,7 @@ data class SynthesisRequest(
     val language: String = "auto",
     val seed: Long = -1,
     val options: SynthesisOptions = SynthesisOptions(),
+    val reference: ReferenceInput? = null,
 )
 
 interface ExecutionSession : Closeable {
@@ -47,12 +49,7 @@ interface ExecutionBackend {
     fun open(model: ModelPackage): ExecutionSession
 }
 
-/**
- * Boundary for the licensed Qualcomm AI Runtime JNI layer.  The repository intentionally does
- * not ship QAIRT headers or proprietary HTP libraries, so the default implementation is a
- * closed/unavailable runtime.  A future JNI module can implement this interface without changing
- * the Android synthesis contract or model conversion format.
- */
+/** Boundary for a complete text-to-PCM QNN executor. */
 interface QnnRuntime {
     val available: Boolean
     fun open(model: ModelPackage, target: QualcommTargetSoc): ExecutionSession
@@ -63,49 +60,52 @@ private object OrtQnnRuntime : QnnRuntime {
         get() = runCatching { OrtProvider.QNN in OrtEnvironment.getAvailableProviders() }.getOrDefault(false)
 
     override fun open(model: ModelPackage, target: QualcommTargetSoc): ExecutionSession {
-        require(available) { "ONNX Runtime QNN EP 未加载" }
-        require(model.runtimeFile("runtime/frontend/g2pW.onnx").isFile) {
-            "当前 QNN 混合包缺少完整 G2PW ONNX 前端"
+        require(available) { "ONNX Runtime QNN EP is not loaded" }
+        val descriptorFile = model.runtimeFile(model.backendArtifact)
+        require(descriptorFile.isFile) { "QNN package backend artifact is missing" }
+        val descriptor = JSONObject(descriptorFile.readText())
+        require(descriptor.optString("format") == "gsv-qnn-executor") {
+            "QNN attachment does not expose the high-level executor ABI"
         }
-        return QnnHtpG2pwSession(model, target)
+        require(descriptor.optInt("format_version") == 1)
+        require(descriptor.optInt("runtime_abi_version") == 1) {
+            "QNN executor runtime ABI is unsupported"
+        }
+        require(descriptor.optString("operation") == "synthesize_utf8_to_pcm16")
+        require(descriptor.optBoolean("complete")) { "QNN executor is incomplete" }
+        require(descriptor.optBoolean("utf8_text_input")) { "QNN executor does not accept UTF-8 text" }
+        require(descriptor.optBoolean("pcm16_output")) { "QNN executor does not return PCM16" }
+        require(!descriptor.optBoolean("cpu_neural_fallback", true)) {
+            "QNN executor enables CPU neural fallback"
+        }
+        return when (val engine = descriptor.optString("engine")) {
+            "gpt-sovits-v2pp-qnn-buckets" ->
+                QnnV2ppRuntime.openArtifactSession(model, target, descriptor)
+            else -> error("QNN executor engine is not implemented: $engine")
+        }
     }
 }
 
 class QnnHtpBackend(private val runtime: QnnRuntime = OrtQnnRuntime) : ExecutionBackend {
     override fun supports(model: ModelPackage): Boolean {
-        if (!runtime.available) return false
+        if (model.executor != "qnn-htp" || !model.deployable || !model.strictCpuFallback) return false
         val status = QualcommTargetPolicy.current()
         if (!status.isProductTarget) return false
-        // A target-labelled QNN package is preferred.  During the transition, a complete CPU
-        // package can still be opened as a mixed artifact: only its exact G2PW graph is executed
-        // by QNN HTP and the frozen acoustic graph remains the CPU reference.
-        val targetPackage = QualcommTargetPolicy.isCompatible(model, status)
-        val mixedFrontend = model.executor in setOf("torchscript-cpu-single", "torchscript-cpu-staged") &&
-            model.runtimeFile("runtime/frontend/g2pW.onnx").isFile
-        return targetPackage || mixedFrontend
+        return QualcommTargetPolicy.isCompatible(model, status)
     }
 
     override fun open(model: ModelPackage): ExecutionSession {
         val status = QualcommTargetPolicy.current()
         require(status.isProductTarget) {
-            "当前设备不在 QNN 产品目标内（仅支持 Snapdragon 8 Gen 3、8 Elite、8 Elite Gen 5）"
+            "this device is not a supported QNN product target (Snapdragon 8 Gen 3, 8 Elite, or 8 Elite Gen 5)"
         }
         if (model.executor == "qnn-htp") {
             require(QualcommTargetPolicy.isCompatible(model, status)) {
-                "QNN HTP artifact 不可用：${QualcommTargetPolicy.explain(model, status)}"
+                "QNN HTP artifact is unavailable: ${QualcommTargetPolicy.explain(model, status)}"
             }
         }
         return runtime.open(model, requireNotNull(status.target))
     }
-}
-
-/** Mixed V2PP session: the artifact decides QNN/CPU graph placement; acoustic stays FP32 CPU. */
-private class QnnHtpG2pwSession(model: ModelPackage, target: QualcommTargetSoc) : ExecutionSession {
-    private val delegate = NativeCpuSession(model, target, strictQnn = model.strictCpuFallback)
-    override val displayName: String
-        get() = delegate.displayName
-    override fun synthesize(request: SynthesisRequest, output: File): File = delegate.synthesize(request, output)
-    override fun close() = delegate.close()
 }
 
 /**
@@ -114,11 +114,10 @@ private class QnnHtpG2pwSession(model: ModelPackage, target: QualcommTargetSoc) 
  */
 class CpuBackend : ExecutionBackend {
     override fun supports(model: ModelPackage) =
-        model.executor in setOf("torchscript-cpu-single", "torchscript-cpu-staged") ||
-            (model.executor == "qnn-htp" && !model.strictCpuFallback)
+        model.executor in setOf("torchscript-cpu-single", "torchscript-cpu-staged")
     override fun open(model: ModelPackage): ExecutionSession {
-        require(model.entrypoint == "synthesize_utf8_to_pcm16") { "未知入口 ${model.entrypoint}" }
-        require(model.deployable) { "CPU 图已生成，但文本前端尚未融合，包未标记为可部署" }
+        require(model.entrypoint == "synthesize_utf8_to_pcm16") { "unknown entrypoint ${model.entrypoint}" }
+        require(model.deployable) { "CPU graphs exist, but the text frontend is not fused and the package is not deployable" }
         return if(model.executor=="torchscript-cpu-staged") StagedCpuSession(model) else NativeCpuSession(model)
     }
 }
@@ -132,40 +131,83 @@ private class StagedCpuSession(private val model: ModelPackage) : ExecutionSessi
         return try {
             val result = TimingContext.with(trace) {
                 TimingContext.measure("request.validate") {
-                    require(request.text.isNotBlank()) { "文本不能为空" }
-                    requireOptions(model, request.options)
+                    require(request.text.isNotBlank()) { "text must not be empty" }
+                    requireOptions(model, request.options, request.seed)
+                    requireReferenceInput(model, request.reference)
                 }
                 val prepared = TimingContext.measure("frontend.prepare") {
-                    FullZhFrontend(model.runtimeFile("runtime/frontend")).use { it.prepare(request.text) }
+                    FullTextFrontend(model.runtimeFile("runtime/frontend")).use { frontend ->
+                        frontend.prepare(request.text, request.language) to request.reference?.let {
+                            frontend.prepare(it.text, it.language)
+                        }
+                    }
                 }
                 val features = TimingContext.measure("bert.module_load") {
                     Module.load(model.runtimeFile("runtime/bert.pt").path)
                 }.useModule { bert ->
-                    TimingContext.measure("bert.inference") {
-                        bert.forward(
-                            IValue.from(Tensor.fromBlob(prepared.tokenIds,longArrayOf(prepared.tokenIds.size.toLong()))),
-                            IValue.from(Tensor.fromBlob(prepared.word2ph,longArrayOf(prepared.word2ph.size.toLong()))),
-                            IValue.from(Tensor.fromBlob(prepared.chineseMask,longArrayOf(prepared.chineseMask.size.toLong())))
-                        ).toTensor().let { Tensor.fromBlob(it.dataAsFloatArray,it.shape()) }
+                    fun infer(value: FullTextFrontend.Prepared): Tensor {
+                        val features = FloatArray(value.phoneIds.size * 1024)
+                        value.bertSpans.forEach { span ->
+                            val tokenShape = longArrayOf(1, span.tokenIds.size.toLong())
+                            val output = bert.forward(
+                                IValue.from(Tensor.fromBlob(span.tokenIds, tokenShape)),
+                                IValue.from(Tensor.fromBlob(LongArray(span.tokenIds.size) { 1L }, tokenShape)),
+                                IValue.from(Tensor.fromBlob(LongArray(span.tokenIds.size) { 0L }, tokenShape)),
+                                IValue.from(Tensor.fromBlob(span.word2ph,longArrayOf(span.word2ph.size.toLong()))),
+                            ).toTensor().dataAsFloatArray
+                            require(output.size == span.phoneCount * 1024) {
+                                "BERT output does not match the frontend phone span"
+                            }
+                            output.copyInto(features, span.phoneOffset * 1024)
+                        }
+                        return Tensor.fromBlob(features, longArrayOf(value.phoneIds.size.toLong(), 1024))
                     }
+                    TimingContext.measure("bert.inference") { infer(prepared.first) to prepared.second?.let(::infer) }
                 }
                 val acoustic = TimingContext.measure("acoustic.module_load") {
                     Module.load(model.runtimeFile("runtime/acoustic.pt").path)
                 }
                 val acousticResult = acoustic.useModule { module ->
                     TimingContext.measure("acoustic.inference") {
-                        val phone = IValue.from(Tensor.fromBlob(prepared.phoneIds,longArrayOf(1,prepared.phoneIds.size.toLong())))
-                        val bert = IValue.from(features)
-                        if (model.runtimeOptionsVersion >= 1) module.forward(
-                            phone, bert,
-                            IValue.from(request.options.temperature.toDouble()),
-                            IValue.from(request.options.topK.toLong()),
-                            IValue.from(request.options.topP.toDouble()),
-                            IValue.from(request.options.repetitionPenalty.toDouble()),
-                            IValue.from(request.options.speedFactor.toDouble()),
-                            IValue.from(request.options.sampleSteps.toLong()),
-                            IValue.from(request.seed),
-                        ) else module.forward(phone, bert, IValue.from(10L))
+                        val phone = IValue.from(Tensor.fromBlob(prepared.first.phoneIds,longArrayOf(1,prepared.first.phoneIds.size.toLong())))
+                        val bert = IValue.from(features.first)
+                        val reference = request.reference
+                        if (reference != null) {
+                            val prompt = requireNotNull(prepared.second)
+                            module.runMethod(
+                                "synthesize_reference_options",
+                                phone, bert,
+                                IValue.from(Tensor.fromBlob(reference.pcm16k, longArrayOf(1, reference.pcm16k.size.toLong()))),
+                                IValue.from(Tensor.fromBlob(reference.pcm32k, longArrayOf(1, reference.pcm32k.size.toLong()))),
+                                IValue.from(Tensor.fromBlob(prompt.phoneIds, longArrayOf(1, prompt.phoneIds.size.toLong()))),
+                                IValue.from(requireNotNull(features.second)),
+                                IValue.from(request.options.temperature.toDouble()),
+                                IValue.from(request.options.topK.toLong()),
+                                IValue.from(request.options.topP.toDouble()),
+                                IValue.from(request.options.repetitionPenalty.toDouble()),
+                                IValue.from(request.options.speedFactor.toDouble()),
+                                IValue.from(request.options.sampleSteps.toLong()),
+                                IValue.from(request.seed),
+                            )
+                        } else if (model.runtimeOptionsVersion >= 1) {
+                            val common = arrayOf(
+                                phone, bert,
+                                IValue.from(request.options.temperature.toDouble()),
+                                IValue.from(request.options.topK.toLong()),
+                                IValue.from(request.options.topP.toDouble()),
+                                IValue.from(request.options.repetitionPenalty.toDouble()),
+                                IValue.from(request.options.speedFactor.toDouble()),
+                            )
+                            if ("sample_steps" in model.runtimeOptions) {
+                                module.forward(
+                                    *common,
+                                    IValue.from(request.options.sampleSteps.toLong()),
+                                    IValue.from(request.seed),
+                                )
+                            } else {
+                                module.forward(*common, IValue.from(request.seed))
+                            }
+                        } else module.forward(phone, bert, IValue.from(10L))
                     }
                 }
                 TimingContext.measure("pcm.convert_validate_wav_write") { writeResult(acousticResult,output) }
@@ -184,11 +226,11 @@ private inline fun <T> Module.useModule(block:(Module)->T):T=try{block(this)}fin
 
 private fun writeResult(result:IValue,output:File):File {
     val tuple=result.toTuple();val sampleRate=tuple[0].toLong().toInt();val pcm32=tuple[1].toTensor().dataAsIntArray
-    require(pcm32.isNotEmpty()){ "模型返回空 PCM" };var peak=0;var clipped=0;var sumSquares=0.0
+    require(pcm32.isNotEmpty()){ "model returned empty PCM" };var peak=0;var clipped=0;var sumSquares=0.0
     pcm32.forEach{value->val sample=value.coerceIn(-32768,32767);val magnitude=kotlin.math.abs(sample);peak=maxOf(peak,magnitude);if(magnitude>=32767)clipped++;sumSquares+=sample.toDouble()*sample}
     val rms=kotlin.math.sqrt(sumSquares/pcm32.size);val clippedRatio=clipped.toDouble()/pcm32.size
-    require(peak>100&&rms>20.0){"模型返回静音 PCM: peak=$peak rms=$rms"}
-    require(rms<20000.0&&clippedRatio<0.01){"模型返回严重削波 PCM: peak=$peak rms=$rms clippedRatio=$clippedRatio"}
+    require(peak>100&&rms>20.0){"model returned silent PCM: peak=$peak rms=$rms"}
+    require(rms<20000.0&&clippedRatio<0.01){"model returned severely clipped PCM: peak=$peak rms=$rms clippedRatio=$clippedRatio"}
     WavWriter.write(output,pcm32.map{it.coerceIn(-32768,32767).toShort()}.toShortArray(),sampleRate);return output
 }
 
@@ -222,8 +264,9 @@ private class NativeCpuSession(
         return try {
             val result = TimingContext.with(trace) {
                 TimingContext.measure("request.validate") {
-                    require(request.text.isNotBlank()) { "文本不能为空" }
-                    requireOptions(model, request.options)
+                    require(request.text.isNotBlank()) { "text must not be empty" }
+                    requireOptions(model, request.options, request.seed)
+                    requireReferenceInput(model, request.reference)
                 }
                 val result = frontend?.let { frontend ->
                     val prepared = TimingContext.measure("frontend.prepare") { frontend.prepare(request.text) }
@@ -240,7 +283,24 @@ private class NativeCpuSession(
                         val tokens = inputs[1]
                         val word2ph = inputs[2]
                         val chinese = inputs[3]
-                        if (model.runtimeOptionsVersion >= 1) module.runMethod("synthesize_preprocessed_options",
+                        val reference = request.reference
+                        if (reference != null) {
+                            val prompt = TimingContext.measure("frontend.reference_prepare") { frontend.prepare(reference.text) }
+                            module.runMethod(
+                                "synthesize_reference_preprocessed_options",
+                                phone, tokens, word2ph, chinese,
+                                IValue.from(Tensor.fromBlob(prompt.phoneIds,longArrayOf(prompt.phoneIds.size.toLong()))),
+                                IValue.from(Tensor.fromBlob(prompt.tokenIds,longArrayOf(prompt.tokenIds.size.toLong()))),
+                                IValue.from(Tensor.fromBlob(prompt.word2ph,longArrayOf(prompt.word2ph.size.toLong()))),
+                                IValue.from(Tensor.fromBlob(prompt.chineseMask,longArrayOf(prompt.chineseMask.size.toLong()))),
+                                IValue.from(Tensor.fromBlob(reference.pcm16k,longArrayOf(1,reference.pcm16k.size.toLong()))),
+                                IValue.from(Tensor.fromBlob(reference.pcm32k,longArrayOf(1,reference.pcm32k.size.toLong()))),
+                                IValue.from(request.seed),
+                                IValue.from(request.options.temperature.toDouble()), IValue.from(request.options.topP.toDouble()),
+                                IValue.from(request.options.topK.toLong()), IValue.from(request.options.repetitionPenalty.toDouble()),
+                                IValue.from(request.options.speedFactor.toDouble()), IValue.from(request.options.sampleSteps.toLong()),
+                            )
+                        } else if (model.runtimeOptionsVersion >= 1) module.runMethod("synthesize_preprocessed_options",
                             phone, tokens, word2ph, chinese, IValue.from(request.seed),
                             IValue.from(request.options.temperature.toDouble()), IValue.from(request.options.topP.toDouble()),
                             IValue.from(request.options.topK.toLong()), IValue.from(request.options.repetitionPenalty.toDouble()),
@@ -270,15 +330,15 @@ private class NativeCpuSession(
                     val sampleRate = tuple[0].toLong().toInt()
                     // PyTorch Android has no Int16 tensor bridge; pipeline returns PCM16 values in Int32.
                     val pcm32 = tuple[1].toTensor().dataAsIntArray
-                    require(pcm32.isNotEmpty()){ "模型返回空 PCM" }
+                    require(pcm32.isNotEmpty()){ "model returned empty PCM" }
                     var peak=0;var clipped=0;var sumSquares=0.0
                     pcm32.forEach { value ->
                         val sample=value.coerceIn(-32768,32767);val magnitude=kotlin.math.abs(sample)
                         peak=maxOf(peak,magnitude);if(magnitude>=32767)clipped++;sumSquares+=sample.toDouble()*sample
                     }
                     val rms=kotlin.math.sqrt(sumSquares/pcm32.size);val clippedRatio=clipped.toDouble()/pcm32.size
-                    require(peak>100&&rms>20.0){"模型返回静音 PCM: peak=$peak rms=$rms"}
-                    require(rms<20000.0&&clippedRatio<0.01){"模型返回严重削波 PCM: peak=$peak rms=$rms clippedRatio=$clippedRatio"}
+                    require(peak>100&&rms>20.0){"model returned silent PCM: peak=$peak rms=$rms"}
+                    require(rms<20000.0&&clippedRatio<0.01){"model returned severely clipped PCM: peak=$peak rms=$rms clippedRatio=$clippedRatio"}
                     val pcm = pcm32.map { it.coerceIn(-32768, 32767).toShort() }.toShortArray()
                     WavWriter.write(output, pcm, sampleRate)
                     output
@@ -294,11 +354,36 @@ private class NativeCpuSession(
     override fun close() { frontend?.close(); module.destroy() }
 }
 
-private fun requireOptions(model: ModelPackage, options: SynthesisOptions) {
-    if (!options.isDefault()) {
-        require(model.runtimeOptionsVersion >= 1) {
-            "当前模型包未导出 runtime_options_version=1，请重新转换后再调节采样参数"
+internal fun requireOptions(model: ModelPackage, options: SynthesisOptions, seed: Long = -1L) {
+    fun requireOption(name: String, changed: Boolean) {
+        if (changed) {
+            require(model.runtimeOptionsVersion >= 1 && name in model.runtimeOptions) {
+                "this package does not declare runtime option $name; reconvert it before changing that value"
+            }
         }
+    }
+    requireOption("temperature", options.temperature != 1.0f)
+    requireOption("top_p", options.topP != 1.0f)
+    requireOption("top_k", options.topK != 10)
+    requireOption("repetition_penalty", options.repetitionPenalty != 1.35f)
+    requireOption("speed_factor", options.speedFactor != 1.0f)
+    requireOption("sample_steps", options.sampleSteps != 32)
+    requireOption("seed", seed != -1L)
+}
+
+internal fun requireReferenceInput(model: ModelPackage, reference: ReferenceInput?) {
+    if (reference == null) return
+    require(model.referenceInputVersion >= 1) {
+        "this model package does not support runtime reference input; reconvert it with the current tool"
+    }
+    require(reference.text.isNotBlank()) { "reference transcript is required" }
+    require(reference.pcm16k.isNotEmpty() && reference.pcm32k.isNotEmpty()) { "reference PCM is empty" }
+    requireSupportedLanguage(reference.language, "reference_language")
+}
+
+internal fun requireSupportedLanguage(language: String, field: String = "language") {
+    require(language.lowercase() in setOf("auto", "zh", "en")) {
+        "$field=$language is unsupported; use auto, zh, or en"
     }
 }
 
@@ -325,23 +410,44 @@ private object WavWriter {
 class TtsEngine(private val backends: List<ExecutionBackend>) : Closeable {
     @Volatile
     private var session: ExecutionSession? = null
+    @Volatile
+    private var loadedModel: ModelPackage? = null
     var lastLoadDiagnostic: String = ""
         private set
     val isLoaded get() = session != null
-    val backendName get() = session?.displayName ?: "未加载"
+    val backendName get() = session?.displayName ?: "not loaded"
+    val loadedPackage: ModelPackage? get() = loadedModel
+    val referenceExactPcm16kSamples: Int?
+        get() = loadedModel?.takeIf { it.referenceDurationPolicy == "exact_samples" }
+            ?.referencePcm16kSamples?.takeIf { it > 0 }
     fun load(model: ModelPackage) {
         val trace = TimingTrace("engine.load")
         try {
             TimingContext.with(trace) {
-                TimingContext.measure("previous_session.close") { session?.close() }
                 val errors = mutableListOf<String>()
-                for (backend in backends) {
+                val candidates = backends.filter { backend ->
                     val supported = TimingContext.measure("backend.supports.${backend.javaClass.simpleName}") {
-                        runCatching { backend.supports(model) }.getOrElse { false }
+                        runCatching { backend.supports(model) }
+                            .onFailure { error ->
+                                errors += "${backend.javaClass.simpleName} supports: " +
+                                    (error.message ?: error::class.simpleName)
+                            }
+                            .getOrDefault(false)
                     }
-                    if (!supported) continue
+                    supported
+                }
+                if (candidates.isEmpty()) {
+                    lastLoadDiagnostic = errors.joinToString(" | ")
+                    val suffix = if (errors.isEmpty()) "" else "; checks: ${errors.joinToString(" | ")}"
+                    error("unsupported executor=${model.executor}$suffix")
+                }
+                TimingContext.measure("previous_session.close") { session?.close() }
+                session = null
+                loadedModel = null
+                for (backend in candidates) {
                     try {
                         session = TimingContext.measure("backend.open.${backend.javaClass.simpleName}") { backend.open(model) }
+                        loadedModel = model
                         lastLoadDiagnostic = if (errors.isEmpty()) "" else errors.joinToString(" | ")
                         TimingContext.mark("backend.selected", session?.displayName)
                         return@with
@@ -349,8 +455,9 @@ class TtsEngine(private val backends: List<ExecutionBackend>) : Closeable {
                         errors += "${backend.javaClass.simpleName}: ${error.message ?: error::class.simpleName}"
                     }
                 }
-                val suffix = if (errors.isEmpty()) "" else "；尝试记录：${errors.joinToString(" | ")}"
-                error("不支持 executor=${model.executor}$suffix")
+                lastLoadDiagnostic = errors.joinToString(" | ")
+                val suffix = if (errors.isEmpty()) "" else "; attempts: ${errors.joinToString(" | ")}"
+                error("unsupported executor=${model.executor}$suffix")
             }
             trace.finish(true)
         } catch (error: Throwable) {
@@ -358,7 +465,10 @@ class TtsEngine(private val backends: List<ExecutionBackend>) : Closeable {
             throw error
         }
     }
-    fun synthesize(request: SynthesisRequest, output: File) =
-        requireNotNull(session) { "尚未加载模型" }.synthesize(request, output)
-    override fun close() { session?.close(); session=null }
+    fun synthesize(request: SynthesisRequest, output: File): File {
+        requireSupportedLanguage(request.language)
+        request.reference?.let { requireSupportedLanguage(it.language, "reference_language") }
+        return requireNotNull(session) { "no model is loaded" }.synthesize(request, output)
+    }
+    override fun close() { session?.close(); session=null; loadedModel=null }
 }

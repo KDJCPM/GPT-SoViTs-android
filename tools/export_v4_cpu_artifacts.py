@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Export a voice-specialized, FP32-only V4 acoustic pipeline for Android CPU.
 
-The expensive and version-sensitive work (checkpoint parsing, HuBERT reference encoding,
-speaker/reference conditioning and graph adaptation) is performed here.  The exported module only
-accepts target phone ids and target BERT features.  No quantization, truncation or dtype conversion
-is used.
+Checkpoint parsing and graph adaptation are performed here. The package keeps preset conditioning
+for the no-input path and a converted HuBERT/reference encoder for request-scoped reference audio.
+No quantization, truncation or dtype conversion is used.
 """
 from __future__ import annotations
 
@@ -75,22 +74,48 @@ class ExportDiT(torch.nn.Module):
         return self.blocks(x, t, mask, rope)
 
 
-class V4Decoder(torch.nn.Module):
-    """Expose the upstream decoder speed input in the deployable graph ABI."""
+class V4VoiceModel(torch.nn.Module):
+    """Share one V4 weight set between target decoding and runtime reference encoding."""
 
-    def __init__(self, model):
+    def __init__(self, model, ssl, hps):
         super().__init__()
         self.model = model
+        self.ssl = ssl
+        self.filter_length = int(hps.data.filter_length)
+        self.sample_rate = int(hps.data.sampling_rate)
+        self.hop_length = int(hps.data.hop_length)
+        self.win_length = int(hps.data.win_length)
 
-    def forward(self, codes: torch.Tensor, text: torch.Tensor, ge: torch.Tensor, speed: float):
+    def forward(self, codes: torch.Tensor, text: torch.Tensor, ge: torch.Tensor, speed: torch.Tensor):
         return self.model(codes, text, ge, speed=speed)
+
+    def reference(self, pcm_16k: torch.Tensor, pcm_32k: torch.Tensor, prompt_phone_ids: torch.Tensor):
+        from module.mel_processing import mel_spectrogram_torch, spectrogram_torch
+        tail = torch.zeros((1, 4800), dtype=pcm_16k.dtype, device=pcm_16k.device)
+        ssl_content = self.ssl(torch.cat([pcm_16k.reshape(1, -1), tail], 1))["last_hidden_state"]
+        ssl_content = ssl_content.transpose(1, 2).float()
+        prompt_semantic = self.model.extract_latent(ssl_content)[0, 0].unsqueeze(0)
+        reference_spectrogram = spectrogram_torch(
+            pcm_32k.float(), self.filter_length, self.sample_rate,
+            self.hop_length, self.win_length, center=False,
+        ).float()
+        speaker_embedding = self.model.create_ge(reference_spectrogram)
+        reference_feature = self.model(
+            prompt_semantic.unsqueeze(0), prompt_phone_ids, speaker_embedding,
+        )
+        reference_mel = mel_spectrogram_torch(
+            pcm_32k.float(), n_fft=1280, win_size=1280, hop_size=320, num_mels=100,
+            sampling_rate=32000, fmin=0, fmax=None, center=False,
+        )
+        reference_mel = (reference_mel + 12.0) / 14.0 * 2.0 - 1.0
+        return prompt_semantic, speaker_embedding, reference_feature, reference_mel
 
 
 class V4AcousticPipeline(torch.nn.Module):
-    def __init__(self, t2s, decoder, cfm, vocoder, conditioning: dict[str, torch.Tensor], sample_steps: int):
+    def __init__(self, t2s, voice, cfm, vocoder, conditioning: dict[str, torch.Tensor], sample_steps: int):
         super().__init__()
         self.t2s = t2s
-        self.decoder = decoder
+        self.voice = voice
         self.cfm = cfm
         self.vocoder = vocoder
         self.sample_steps = sample_steps
@@ -101,10 +126,16 @@ class V4AcousticPipeline(torch.nn.Module):
         self.register_buffer("reference_feature", conditioning["reference_feature"])
         self.register_buffer("reference_mel", conditioning["reference_mel"])
 
-    def forward(
+    def synthesize_conditioned(
         self,
         text_seq: torch.Tensor,
         text_bert: torch.Tensor,
+        prompt_semantic: torch.Tensor,
+        prompt_phone_ids: torch.Tensor,
+        prompt_bert: torch.Tensor,
+        speaker_embedding: torch.Tensor,
+        reference_feature: torch.Tensor,
+        reference_mel: torch.Tensor,
         temperature: float = 1.0,
         top_k: int = 10,
         top_p: float = 1.0,
@@ -117,14 +148,15 @@ class V4AcousticPipeline(torch.nn.Module):
             torch.manual_seed(seed)
         top_k_tensor = torch.tensor([top_k], dtype=torch.long, device=text_seq.device)
         semantic = self.t2s(
-            self.prompt_semantic, self.prompt_phone_ids, text_seq,
-            self.prompt_bert, text_bert, top_k_tensor, temperature, top_p, repetition_penalty,
+            prompt_semantic, prompt_phone_ids, text_seq,
+            prompt_bert, text_bert, top_k_tensor, temperature, top_p, repetition_penalty,
         )
-        feature_todo = self.decoder(semantic, text_seq, self.speaker_embedding, speed_factor)
+        speed = torch.tensor(speed_factor, dtype=torch.float32, device=text_seq.device)
+        feature_todo = self.voice(semantic, text_seq, speaker_embedding, speed)
         # V4 decoder contains ten tail frames which upstream intentionally discards.
         feature_todo = feature_todo[:, :, :-10]
-        feature_ref = self.reference_feature
-        mel_ref = self.reference_mel
+        feature_ref = reference_feature
+        mel_ref = reference_mel
         reference_len = feature_ref.shape[2]
         chunk_len = 1000 - reference_len
         chunks = torch.jit.annotate(list[torch.Tensor], [])
@@ -143,6 +175,54 @@ class V4AcousticPipeline(torch.nn.Module):
         mel = (mel + 1.0) * 7.0 - 12.0
         audio = self.vocoder(mel).reshape(-1).float().clamp(-1.0, 1.0)
         return 48000, torch.round(audio * 32767.0).to(torch.int32)
+
+    def forward(
+        self,
+        text_seq: torch.Tensor,
+        text_bert: torch.Tensor,
+        temperature: float = 1.0,
+        top_k: int = 10,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.35,
+        speed_factor: float = 1.0,
+        sample_steps: int = 32,
+        seed: int = -1,
+    ):
+        return self.synthesize_conditioned(
+            text_seq, text_bert, self.prompt_semantic, self.prompt_phone_ids, self.prompt_bert,
+            self.speaker_embedding, self.reference_feature, self.reference_mel,
+            temperature, top_k, top_p, repetition_penalty, speed_factor, sample_steps, seed,
+        )
+
+    @torch.jit.export
+    def synthesize_reference_options(
+        self,
+        text_seq: torch.Tensor,
+        text_bert: torch.Tensor,
+        reference_pcm_16k: torch.Tensor,
+        reference_pcm_32k: torch.Tensor,
+        prompt_phone_ids: torch.Tensor,
+        prompt_bert: torch.Tensor,
+        temperature: float = 1.0,
+        top_k: int = 10,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.35,
+        speed_factor: float = 1.0,
+        sample_steps: int = 32,
+        seed: int = -1,
+    ):
+        prompt_semantic, speaker_embedding, reference_feature, reference_mel = self.voice.reference(
+            reference_pcm_16k.reshape(1, -1), reference_pcm_32k.reshape(1, -1),
+            prompt_phone_ids.reshape(1, -1),
+        )
+        reference_len = min(reference_feature.shape[2], reference_mel.shape[2], 500)
+        reference_feature = reference_feature[:, :, -reference_len:].contiguous()
+        reference_mel = reference_mel[:, :, -reference_len:].contiguous()
+        return self.synthesize_conditioned(
+            text_seq, text_bert, prompt_semantic, prompt_phone_ids, prompt_bert,
+            speaker_embedding, reference_feature, reference_mel,
+            temperature, top_k, top_p, repetition_penalty, speed_factor, sample_steps, seed,
+        )
 
 
 def load_v4(sovits_path: Path):
@@ -220,8 +300,9 @@ def main() -> None:
     trace_bert = trace_bert.T.contiguous().float().cpu()
 
     zero = np.zeros(int(16000 * 0.3), dtype=np.float32)
-    wav16, _ = librosa.load(reference_path, sr=16000, mono=True)
-    wav16 = torch.from_numpy(np.concatenate([wav16.astype(np.float32), zero])).unsqueeze(0)
+    raw_wav16, _ = librosa.load(reference_path, sr=16000, mono=True)
+    raw_wav16 = torch.from_numpy(raw_wav16.astype(np.float32)).unsqueeze(0)
+    wav16 = torch.cat([raw_wav16, torch.from_numpy(zero).unsqueeze(0)], 1)
     with torch.inference_mode():
         ssl_model.model = ssl_model.model.float().cpu()
         ssl = ssl_model.model(wav16)["last_hidden_state"].transpose(1, 2).float()
@@ -246,11 +327,18 @@ def main() -> None:
     reference_mel = reference_mel[:, :, -ref_len:].contiguous()
     reference_feature = reference_feature[:, :, -ref_len:].contiguous()
 
-    # Keep only the target decoder paths. Checkpoint/history handling is now gone from runtime.
-    decoder_inputs = (prompt_semantic.unsqueeze(0), prompt_phone_ids, speaker_embedding, 1.0)
+    # One traced module shares the SoVITS weights between target decoding and reference encoding.
     target_inputs = (t2s(prompt_semantic, prompt_phone_ids, trace_phone_ids, prompt_bert, trace_bert, torch.tensor([10])),
-                     trace_phone_ids, speaker_embedding, 1.0)
-    decoder = torch.jit.trace(V4Decoder(vq).eval(), target_inputs, check_trace=False, strict=False)
+                     trace_phone_ids, speaker_embedding, torch.tensor(1.0))
+    voice = torch.jit.trace_module(
+        V4VoiceModel(vq, ssl_model.model, hps).eval(),
+        {
+            "forward": target_inputs,
+            "reference": (raw_wav16, ref_audio, prompt_phone_ids),
+        },
+        check_trace=False,
+        strict=False,
+    )
 
     cfm.estimator = ExportDiT(cfm.estimator).eval()
     example_len = min(1000, ref_len + 160)
@@ -273,14 +361,37 @@ def main() -> None:
         "reference_feature": reference_feature,
         "reference_mel": reference_mel,
     }
-    pipeline = torch.jit.script(V4AcousticPipeline(t2s, decoder, cfm_script, vocoder_script, conditioning, args.sample_steps).eval())
+    pipeline = torch.jit.script(
+        V4AcousticPipeline(t2s, voice, cfm_script, vocoder_script, conditioning, args.sample_steps).eval()
+    )
+    pipeline = torch.jit.freeze(pipeline, preserved_attrs=["synthesize_reference_options"])
     pipeline.save(str(output / "pipeline_core.pt"))
     print(f"Created {output / 'pipeline_core.pt'} ({(output / 'pipeline_core.pt').stat().st_size} bytes), FP32, steps={args.sample_steps}")
 
     # A real inference catches shape-specialization and unsupported scripted control flow now.
     torch.manual_seed(1234)
-    sr, pcm = pipeline(trace_phone_ids, trace_bert, 10)
+    sr, pcm = pipeline(trace_phone_ids, trace_bert, 1.0, 10)
     print(f"Smoke inference: sr={sr}, samples={pcm.numel()}, peak={int(pcm.abs().max())}")
+    torch.manual_seed(1234)
+    reference_sr, reference_pcm = pipeline.synthesize_reference_options(
+        trace_phone_ids,
+        trace_bert,
+        raw_wav16,
+        ref_audio,
+        prompt_phone_ids,
+        prompt_bert,
+        1.0,
+        10,
+        1.0,
+        1.35,
+        1.0,
+        args.sample_steps,
+        1234,
+    )
+    print(
+        "Reference smoke inference: "
+        f"sr={reference_sr}, samples={reference_pcm.numel()}, peak={int(reference_pcm.abs().max())}"
+    )
     del raw_t2s, vq, cfm, vocoder
     gc.collect()
 
