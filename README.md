@@ -1,5 +1,7 @@
 # GSV Mobile
 
+[中文文档](README.zh-CN.md)
+
 GSV Mobile converts and runs [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS)
 V2 Pro Plus and V4 voices locally on Android. Exact FP32 CPU execution remains the correctness
 reference. QNN/NPU work is included as an engineering preview only: it has not completed matching
