@@ -95,7 +95,7 @@ object QualcommTargetPolicy {
         require(model.htpArch == target.htpArch) {
             "QNN package htp_arch ${model.htpArch} does not match ${target.htpArch}"
         }
-        require(model.supportedTargetSocs.contains == setOf(target.id)) {
+        require(model.supportedTargetSocs == setOf(target.id)) {
             "QNN package supported_target_socs must contain only ${target.id}"
         }
         val qairtParts = model.qairtVersion.split('.')
