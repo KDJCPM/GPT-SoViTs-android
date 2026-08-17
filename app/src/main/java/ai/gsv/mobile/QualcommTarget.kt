@@ -28,7 +28,7 @@ enum class QualcommTargetSoc(
         setOf("SM8750"),
     ),
     SNAPDRAGON_8_GEN_5(
-        "snapdragon_8_gen_5",
+        "snapdragon_8_elite_gen_5",
         "Snapdragon 8 Gen 5",
         "SM8850",
         87,
