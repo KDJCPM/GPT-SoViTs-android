@@ -27,6 +27,14 @@ enum class QualcommTargetSoc(
         "V79",
         setOf("SM8750"),
     ),
+    SNAPDRAGON_8_GEN_5(
+        "snapdragon_8_gen_5",
+        "Snapdragon 8 Gen 5",
+        "SM8845",
+        57,
+        "V75",
+        setOf("SM8845"),
+    ),
     SNAPDRAGON_8_ELITE_GEN_5(
         "snapdragon_8_elite_gen_5",
         "Snapdragon 8 Elite Gen 5",
