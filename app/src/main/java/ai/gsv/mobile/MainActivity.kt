@@ -998,7 +998,7 @@ private data class ReleaseArtifact(val fileName: String, val sha256: String) {
             QualcommTargetSoc.SNAPDRAGON_8_GEN_3 -> ReleaseArtifact("firefly-v2pp-sm8650.qnn.gsvm", "c35484ad63218af892667a9f2a9de7887f884850c5cb05c4ed2ebefea5206f1a")
             QualcommTargetSoc.SNAPDRAGON_8_ELITE -> ReleaseArtifact("firefly-v2pp-sm8750.qnn.gsvm", "8ad26fc196f345b24071ee14e5c3aa1c4494119c407edebdba4cee3ec9d55ea4")
             QualcommTargetSoc.SNAPDRAGON_8_ELITE_GEN_5 -> ReleaseArtifact("firefly-v2pp-sm8850.qnn.gsvm", "b1cdec977f787a0bdc9f9f61f4c83d4754703552430c6ce05c19662a1130beb2")
-            QualcommTargetSoc.SNAPDRAGON_8_ELITE_GEN_5 -> ReleaseArtifact("firefly-v2pp-sm8850.qnn.gsvm", "b1cdec977f787a0bdc9f9f61f4c83d4754703552430c6ce05c19662a1130beb2")
+            QualcommTargetSoc.SNAPDRAGON_8_GEN_5 -> ReleaseArtifact("firefly-v2pp-sm8850.qnn.gsvm", "b1cdec977f787a0bdc9f9f61f4c83d4754703552430c6ce05c19662a1130beb2")
         }
     }
 }
